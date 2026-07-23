@@ -20,8 +20,9 @@ from openai import OpenAI
 from config.settings import SETTINGS
 
 SYSTEM_PROMPT = (
-    "Você é um assistente de OCR e extração de dados. Você recebe imagens "
-    "de documentos (notas, faturas, tabelas, formulários, prints) e deve "
+    "Você é um assistente de OCR e extração de dados. Você recebe "
+    "documentos como imagens - uma imagem por página, no caso de PDFs - "
+    "(notas, faturas, tabelas, formulários, prints) e deve "
     "transcrever e estruturar o conteúdo com fidelidade. Não invente "
     "valores: quando um campo estiver ilegível, use null e avise. "
     "Responda em português, exceto quando o documento estiver em outro "
@@ -100,7 +101,8 @@ def build_extraction_prompt(
         col_lines.append(line)
 
     parts = [
-        "Extraia da imagem os dados no formato da tabela abaixo.",
+        "Extraia do documento (cada imagem é uma página) os dados no "
+        "formato da tabela abaixo.",
         "Colunas da tabela de destino:",
         "\n".join(col_lines),
     ]

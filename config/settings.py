@@ -43,6 +43,12 @@ class Settings:
     # real formatting examples (0 = schema only, no sample rows).
     sf_sample_rows: int = int(os.getenv("SNOWFLAKE_SAMPLE_ROWS", "5"))
 
+    # Reference table offered by default in the sidebar; the structured
+    # extraction follows this table's columns and types.
+    sf_default_table: str = os.getenv(
+        "SNOWFLAKE_DEFAULT_TABLE", "INSIGHTS_DB.UC_EPCDF_PRD_RSTR.GP_WWBS_HISTORICAL"
+    )
+
     @property
     def databricks_enabled(self) -> bool:
         return bool(self.databricks_host and self.databricks_token)

@@ -6,13 +6,18 @@ extração estruturada no padrão de uma **tabela Snowflake**.
 
 ## Funcionalidades
 
-1. **Upload de imagem** (nota fiscal, fatura, tabela, formulário, print...).
+1. **Upload de imagem ou PDF** (nota fiscal, fatura, tabela, formulário,
+   print...). PDFs são convertidos página a página em imagens (PyMuPDF) e
+   todas as páginas vão para o modelo (limite de 15).
 2. **OCR livre** — transcrição fiel em markdown, preservando a estrutura.
-3. **Extração no padrão de uma tabela Snowflake** — informe
-   `DB.SCHEMA.TABELA`; o app lê o schema (`DESCRIBE TABLE`) e algumas linhas
-   de exemplo, e o modelo devolve os dados da imagem como linhas dessa tabela
-   (JSON → DataFrame editável).
-4. **Chat** — converse com o modelo sobre o documento (a imagem e os
+3. **Extração no padrão de uma tabela Snowflake** — a sidebar já vem
+   preenchida com a tabela de referência padrão
+   (`INSIGHTS_DB.UC_EPCDF_PRD_RSTR.GP_WWBS_HISTORICAL`, configurável via
+   `SNOWFLAKE_DEFAULT_TABLE`); o app lê o schema (`DESCRIBE TABLE`) e algumas
+   linhas de exemplo, e o modelo devolve os dados do documento como linhas
+   dessa tabela (JSON → DataFrame editável). Um toggle permite escolher entre
+   extrair nesse formato ou fazer transcrição livre.
+4. **Chat** — converse com o modelo sobre o documento (as páginas e os
    resultados já extraídos vão como contexto).
 5. **Export** — CSV / Excel da extração estruturada (após revisão no editor)
    ou `.md` da transcrição.
@@ -51,11 +56,15 @@ Mesmas variáveis do projeto `lab_data-quali-score` (`SNOWFLAKE_ACCOUNT`,
 `SNOWFLAKE_SAMPLE_ROWS` (padrão 5) controla quantas linhas reais da tabela são
 mostradas ao modelo como exemplo de formatação (0 = só o schema).
 
+`SNOWFLAKE_DEFAULT_TABLE` define a tabela de referência sugerida na sidebar
+(padrão: `INSIGHTS_DB.UC_EPCDF_PRD_RSTR.GP_WWBS_HISTORICAL`).
+
 ## Estrutura
 
 ```
 app.py                    # UI Streamlit (upload, OCR, chat, export)
 config/settings.py        # settings via .env
+src/documents.py          # imagem/PDF -> páginas (PyMuPDF)
 src/llm_client.py         # Claude via Databricks (OpenAI SDK) + prompts + parse JSON
 src/snowflake_client.py   # conexão Snowflake (adaptado do lab_data-quali-score)
 ```

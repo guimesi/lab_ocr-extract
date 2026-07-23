@@ -1,9 +1,9 @@
 """
 OCR Extract - Streamlit app.
 
-Upload de imagem -> OCR com Claude (via Databricks serving endpoint,
-OpenAI SDK) -> chat sobre o documento -> extração estruturada no padrão
-de uma tabela Snowflake -> export CSV / Excel.
+Upload de imagem ou PDF -> OCR com Claude (via Databricks serving
+endpoint, OpenAI SDK) -> chat sobre o documento -> extração estruturada
+no padrão de uma tabela Snowflake -> export CSV / Excel.
 
 Run: streamlit run app.py
 """
@@ -15,7 +15,7 @@ import pandas as pd
 import streamlit as st
 
 from config.settings import SETTINGS
-from src import llm_client
+from src import documents, llm_client
 from src.snowflake_client import get_shared_client, qualify
 
 st.set_page_config(
@@ -37,6 +37,13 @@ def load_table_schema(table_ref: str) -> pd.DataFrame:
 @st.cache_data(ttl=600, show_spinner="Buscando linhas de exemplo...")
 def load_table_sample(table_ref: str, limit: int) -> pd.DataFrame:
     return get_shared_client().fetch_sample(table_ref, limit=limit)
+
+
+@st.cache_data(ttl=600, show_spinner="Preparando o documento...")
+def load_document_pages(
+    file_bytes: bytes, mime_type: str
+) -> tuple[list[tuple[bytes, str]], int]:
+    return documents.load_pages(file_bytes, mime_type)
 
 
 # =============================================================================
@@ -92,8 +99,8 @@ with st.sidebar:
     else:
         table_input = st.text_input(
             "Tabela (NOME, SCHEMA.NOME ou DB.SCHEMA.NOME)",
-            value=st.session_state.table_ref,
-            placeholder="ex.: VENDAS.NOTAS_FISCAIS",
+            value=st.session_state.table_ref or SETTINGS.sf_default_table,
+            placeholder="ex.: DB.SCHEMA.TABELA",
         )
         col_load, col_clear = st.columns(2)
         if col_load.button("Carregar schema", width="stretch", type="primary"):
@@ -127,14 +134,14 @@ with st.sidebar:
 st.header("1. Documento", divider="gray")
 
 uploaded = st.file_uploader(
-    "Envie uma imagem (nota, fatura, tabela, formulário...)",
-    type=["png", "jpg", "jpeg", "webp", "gif"],
+    "Envie uma imagem ou PDF (nota, fatura, tabela, formulário...)",
+    type=["png", "jpg", "jpeg", "webp", "gif", "pdf"],
 )
 
 if uploaded is None:
     st.session_state.image_key = None
     reset_results()
-    st.info("Envie uma imagem para começar.", icon=":material/upload_file:")
+    st.info("Envie uma imagem ou PDF para começar.", icon=":material/upload_file:")
     st.stop()
 
 # New file replaces previous results / conversation
@@ -142,16 +149,40 @@ if st.session_state.image_key != uploaded.file_id:
     st.session_state.image_key = uploaded.file_id
     reset_results()
 
-image_bytes = uploaded.getvalue()
+file_bytes = uploaded.getvalue()
 mime_type = uploaded.type or "image/png"
+pages, total_pages = load_document_pages(file_bytes, mime_type)
+if total_pages > len(pages):
+    st.warning(
+        f"O PDF tem {total_pages} páginas; apenas as {len(pages)} primeiras "
+        "serão processadas.",
+        icon=":material/warning:",
+    )
+
+# One image content part per page, reused in every model call.
+page_parts = [llm_client.image_content(b, m) for b, m in pages]
 
 col_img, col_ocr = st.columns([2, 3], gap="large")
 
 with col_img:
-    st.image(image_bytes, caption=uploaded.name, width="stretch")
+    st.image(pages[0][0], caption=uploaded.name, width="stretch")
+    if len(pages) > 1:
+        with st.expander(f"Ver todas as {len(pages)} páginas"):
+            for i, (page_bytes, _) in enumerate(pages, start=1):
+                st.image(page_bytes, caption=f"Página {i}", width="stretch")
 
 with col_ocr:
-    structured = bool(st.session_state.table_ref)
+    structured = False
+    if st.session_state.table_ref:
+        structured = st.toggle(
+            "Extrair no padrão da tabela de referência",
+            value=True,
+            help=(
+                f"Preenche as colunas de `{st.session_state.table_ref}` com os "
+                "dados do documento. Desative para uma transcrição livre em "
+                "markdown."
+            ),
+        )
     extra = st.text_area(
         "Instruções adicionais (opcional)",
         placeholder="ex.: considere apenas a tabela de itens, ignore o rodapé",
@@ -171,13 +202,13 @@ with col_ocr:
                 except Exception:
                     sample = None  # amostra é opcional; o schema basta
             prompt = llm_client.build_extraction_prompt(schema, sample, extra)
-            with st.spinner("Extraindo dados da imagem..."):
+            with st.spinner("Extraindo dados do documento..."):
                 answer = llm_client.complete([
                     {
                         "role": "user",
                         "content": [
                             {"type": "text", "text": prompt},
-                            llm_client.image_content(image_bytes, mime_type),
+                            *page_parts,
                         ],
                     }
                 ])
@@ -191,8 +222,9 @@ with col_ocr:
                 st.code(answer)
         else:
             ocr_prompt = (
-                "Transcreva todo o conteúdo da imagem em markdown, "
+                "Transcreva todo o conteúdo do documento em markdown, "
                 "preservando a estrutura (títulos, tabelas, campos). "
+                "Cada imagem é uma página; transcreva na ordem. "
                 "Marque trechos ilegíveis com [ilegível]."
             )
             if extra.strip():
@@ -204,7 +236,7 @@ with col_ocr:
                             "role": "user",
                             "content": [
                                 {"type": "text", "text": ocr_prompt},
-                                llm_client.image_content(image_bytes, mime_type),
+                                *page_parts,
                             ],
                         }
                     ])
@@ -268,9 +300,12 @@ if prompt := st.chat_input("Pergunte algo sobre o documento...", submit_mode="di
     with st.chat_message("user"):
         st.write(prompt)
 
-    # API messages: the image (and any prior result) goes as context in
-    # the first user turn; the visible history follows as plain text.
-    context_parts: list[str] = ["Esta é a imagem do documento em análise."]
+    # API messages: the document pages (and any prior result) go as
+    # context in the first user turn; the visible history follows as
+    # plain text.
+    context_parts: list[str] = [
+        "Este é o documento em análise (uma imagem por página)."
+    ]
     if st.session_state.ocr_text:
         context_parts.append(
             "Transcrição OCR já produzida:\n" + st.session_state.ocr_text
@@ -285,7 +320,7 @@ if prompt := st.chat_input("Pergunte algo sobre o documento...", submit_mode="di
             "role": "user",
             "content": [
                 {"type": "text", "text": "\n\n".join(context_parts)},
-                llm_client.image_content(image_bytes, mime_type),
+                *page_parts,
             ],
         },
         {
