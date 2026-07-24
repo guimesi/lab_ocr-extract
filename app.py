@@ -239,9 +239,17 @@ with col_ocr:
                         }
                     ])
                 try:
-                    frames.append(
-                        llm_client.parse_rows_json(answer, schema["NAME"].tolist())
+                    df_batch = llm_client.parse_rows_json(
+                        answer, schema["NAME"].tolist()
                     )
+                    frames.append(df_batch)
+                    if df_batch.empty:
+                        st.info(
+                            f"Pages {first}-{last}: no matching records found.",
+                            icon=":material/info:",
+                        )
+                        with st.expander(f"Raw response (pages {first}-{last})"):
+                            st.code(answer)
                 except ValueError as exc:
                     failed_ranges.append(f"{first}-{last}")
                     st.warning(
@@ -251,8 +259,18 @@ with col_ocr:
                     with st.expander(f"Raw response (pages {first}-{last})"):
                         st.code(answer)
             if frames:
-                st.session_state.extracted_df = pd.concat(frames, ignore_index=True)
+                result = pd.concat(frames, ignore_index=True)
+                st.session_state.extracted_df = result
                 st.session_state.ocr_text = None
+                if result.empty:
+                    st.info(
+                        "The model found no records matching the reference "
+                        "table in any page. Check the raw responses above to "
+                        "see its reasoning, and consider pointing it to the "
+                        "right content via 'Additional instructions' (e.g. "
+                        "'the WBS table starts on page 12').",
+                        icon=":material/search_off:",
+                    )
             if failed_ranges:
                 st.warning(
                     "Some page ranges could not be parsed and were skipped: "

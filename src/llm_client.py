@@ -114,10 +114,11 @@ def build_extraction_prompt(
     parts.append(
         "Answer ONLY with a JSON array of objects - one object per "
         "row/record identified in the document, with exactly the keys "
-        "above (uppercase). Use null for missing or illegible fields. "
-        "If nothing in these pages matches the target table, answer "
-        "with an empty array: []. Do not include any explanation "
-        "outside the JSON."
+        "above (uppercase). Extract every record you can identify, even "
+        "if incomplete - use null for fields the document does not show "
+        "or that are illegible. Only if the pages contain no extractable "
+        "records at all, answer with an empty array: []. Do not include "
+        "any explanation outside the JSON."
     )
     if extra_instructions.strip():
         parts.append(f"Additional user instructions: {extra_instructions.strip()}")
