@@ -1,26 +1,26 @@
 # OCR Extract
 
-App Streamlit para OCR de documentos com **Claude via Databricks** (Foundation
-Model API, consumida com o **OpenAI SDK**), com chat sobre o documento e
-extração estruturada no padrão de uma **tabela Snowflake**.
+Streamlit app for document OCR with **Claude via Databricks** (Foundation
+Model API, consumed through the **OpenAI SDK**), with chat about the document
+and structured extraction following a **Snowflake table** layout.
 
-## Funcionalidades
+## Features
 
-1. **Upload de imagem ou PDF** (nota fiscal, fatura, tabela, formulário,
-   print...). PDFs são convertidos página a página em imagens (PyMuPDF) e
-   todas as páginas vão para o modelo (limite de 15).
-2. **OCR livre** — transcrição fiel em markdown, preservando a estrutura.
-3. **Extração no padrão de uma tabela Snowflake** — a sidebar já vem
-   preenchida com a tabela de referência padrão
-   (`INSIGHTS_DB.UC_EPCDF_PRD_RSTR.GP_WWBS_HISTORICAL`, configurável via
-   `SNOWFLAKE_DEFAULT_TABLE`); o app lê o schema (`DESCRIBE TABLE`) e algumas
-   linhas de exemplo, e o modelo devolve os dados do documento como linhas
-   dessa tabela (JSON → DataFrame editável). Um toggle permite escolher entre
-   extrair nesse formato ou fazer transcrição livre.
-4. **Chat** — converse com o modelo sobre o documento (as páginas e os
-   resultados já extraídos vão como contexto).
-5. **Export** — CSV / Excel da extração estruturada (após revisão no editor)
-   ou `.md` da transcrição.
+1. **Image or PDF upload** (invoice, receipt, table, form, screenshot...).
+   PDFs are rendered page by page into images (PyMuPDF); all pages go to the
+   model, in batches for large files.
+2. **Free-form OCR** — faithful markdown transcription, preserving structure.
+3. **Extraction following a Snowflake table layout** — the sidebar comes
+   prefilled with the default reference table
+   (`INSIGHTS_DB.UC_EPCDF_PRD_RSTR.GP_WWBS_HISTORICAL`, configurable via
+   `SNOWFLAKE_DEFAULT_TABLE`); the app reads the schema (`DESCRIBE TABLE`)
+   and a few sample rows, and the model returns the document data as rows of
+   that table (JSON → editable DataFrame). A toggle switches between this
+   structured extraction and the free-form transcription.
+4. **Chat** — talk to the model about the document (the pages and any
+   extracted results are sent as context).
+5. **Export** — CSV / Excel for the structured extraction (after review in
+   the editor) or `.md` for the transcription.
 
 ## Setup
 
@@ -28,53 +28,59 @@ extração estruturada no padrão de uma **tabela Snowflake**.
 python -m venv .venv
 .venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-copy .env.example .env   # e preencha os valores
+copy .env.example .env   # then fill in the values
 streamlit run app.py
 ```
 
-## Configuração (`.env`)
+## Configuration (`.env`)
 
-### Databricks (obrigatório)
+### Databricks (required)
 
-| Variável | Descrição |
+| Variable | Description |
 |---|---|
-| `DATABRICKS_HOST` | URL do workspace, ex.: `https://adb-123...azuredatabricks.net` |
+| `DATABRICKS_HOST` | Workspace URL, e.g. `https://adb-123...azuredatabricks.net` (without `/serving-endpoints`) |
 | `DATABRICKS_TOKEN` | Personal Access Token (User Settings → Developer → Access tokens) |
-| `DATABRICKS_MODEL` | Nome do serving endpoint, ex.: `databricks-claude-sonnet-4-5` |
+| `DATABRICKS_MODEL` | Serving endpoint name, e.g. `databricks-claude-sonnet-4-5` |
 
-O OpenAI SDK aponta para `{DATABRICKS_HOST}/serving-endpoints`, com o PAT como
-`api_key` e o nome do endpoint como `model`. O endpoint precisa aceitar
-entrada de imagem (os endpoints Claude pay-per-token aceitam).
+The OpenAI SDK points to `{DATABRICKS_HOST}/serving-endpoints`, with the PAT
+as `api_key` and the endpoint name as `model`. The endpoint must accept image
+input (the pay-per-token Claude endpoints do).
 
-### Snowflake (opcional — habilita a tabela de referência)
+### Snowflake (optional — enables the reference table)
 
-Mesmas variáveis do projeto `lab_data-quali-score` (`SNOWFLAKE_ACCOUNT`,
-`SNOWFLAKE_USER`, `SNOWFLAKE_AUTHENTICATOR=externalbrowser`,
-`SNOWFLAKE_WAREHOUSE`, `SNOWFLAKE_DATABASE`, `SNOWFLAKE_SCHEMA`,
-`SNOWFLAKE_ROLE`). Sem elas o app funciona só com OCR livre + chat.
+`SNOWFLAKE_ACCOUNT`, `SNOWFLAKE_USER`,
+`SNOWFLAKE_AUTHENTICATOR=externalbrowser`, `SNOWFLAKE_WAREHOUSE`,
+`SNOWFLAKE_DATABASE`, `SNOWFLAKE_SCHEMA`, `SNOWFLAKE_ROLE`. Without them the
+app still works with free-form OCR + chat.
 
-`SNOWFLAKE_SAMPLE_ROWS` (padrão 5) controla quantas linhas reais da tabela são
-mostradas ao modelo como exemplo de formatação (0 = só o schema).
+`SNOWFLAKE_SAMPLE_ROWS` (default 5) controls how many real rows of the table
+are shown to the model as formatting examples (0 = schema only).
 
-`SNOWFLAKE_DEFAULT_TABLE` define a tabela de referência sugerida na sidebar
-(padrão: `INSIGHTS_DB.UC_EPCDF_PRD_RSTR.GP_WWBS_HISTORICAL`).
+`SNOWFLAKE_DEFAULT_TABLE` sets the reference table suggested in the sidebar
+(default: `INSIGHTS_DB.UC_EPCDF_PRD_RSTR.GP_WWBS_HISTORICAL`).
 
-## Estrutura
+### PDF handling
+
+`PDF_MAX_PAGES` (default 0 = no limit) caps how many pages are rendered.
+`PDF_PAGES_PER_CALL` (default 10) controls how many pages go to the model per
+call — large PDFs are processed in batches and the results concatenated.
+
+## Structure
 
 ```
-app.py                    # UI Streamlit (upload, OCR, chat, export)
+app.py                    # Streamlit UI (upload, OCR, chat, export)
 config/settings.py        # settings via .env
-src/documents.py          # imagem/PDF -> páginas (PyMuPDF)
-src/llm_client.py         # Claude via Databricks (OpenAI SDK) + prompts + parse JSON
-src/snowflake_client.py   # conexão Snowflake (adaptado do lab_data-quali-score)
+src/documents.py          # image/PDF -> pages (PyMuPDF)
+src/llm_client.py         # Claude via Databricks (OpenAI SDK) + prompts + JSON parsing
+src/snowflake_client.py   # Snowflake connection (adapted from lab_data-quali-score)
 ```
 
-## Notas
+## Notes
 
-- A conexão Snowflake usa `externalbrowser` por padrão (abre o navegador na
-  primeira consulta) e é compartilhada no processo para evitar múltiplas
-  autenticações.
-- O modelo é instruído a **não inventar valores**: campos ilegíveis viram
-  `null` na extração estruturada e `[ilegível]` na transcrição.
-- Revise sempre a extração no editor antes de exportar — OCR de LLM é bom,
-  mas não infalível.
+- The Snowflake connection uses `externalbrowser` by default (opens the
+  browser on the first query) and is shared process-wide to avoid repeated
+  authentications.
+- The model is instructed to **never invent values**: illegible fields become
+  `null` in the structured extraction and `[illegible]` in the transcription.
+- Always review the extraction in the editor before exporting — LLM OCR is
+  good, but not infallible.

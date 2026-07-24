@@ -49,12 +49,12 @@ def qualify(table_ref: str) -> str:
     elif len(parts) == 2:
         parts = [SETTINGS.sf_database, parts[0], parts[1]]
     elif len(parts) != 3:
-        raise ValueError(f"Referência de tabela inválida: {table_ref!r}")
+        raise ValueError(f"Invalid table reference: {table_ref!r}")
     for p in parts:
         if not p or not _IDENT.match(p):
             raise ValueError(
-                f"Identificador inválido em {table_ref!r}: {p!r}. "
-                "Use nomes sem aspas (letras, números, _ e $)."
+                f"Invalid identifier in {table_ref!r}: {p!r}. "
+                "Use unquoted names (letters, digits, _ and $)."
             )
     return ".".join(p.upper() for p in parts)
 

@@ -20,21 +20,20 @@ from openai import OpenAI
 from config.settings import SETTINGS
 
 SYSTEM_PROMPT = (
-    "Você é um assistente de OCR e extração de dados. Você recebe "
-    "documentos como imagens - uma imagem por página, no caso de PDFs - "
-    "(notas, faturas, tabelas, formulários, prints) e deve "
-    "transcrever e estruturar o conteúdo com fidelidade. Não invente "
-    "valores: quando um campo estiver ilegível, use null e avise. "
-    "Responda em português, exceto quando o documento estiver em outro "
-    "idioma e o usuário pedir transcrição literal."
+    "You are an OCR and data-extraction assistant. You receive documents "
+    "as images - one image per page, for PDFs - (invoices, receipts, "
+    "tables, forms, screenshots) and must transcribe and structure their "
+    "content faithfully. Never invent values: when a field is illegible, "
+    "use null and say so. Respond in English, except when transcribing "
+    "literal content from a document written in another language."
 )
 
 
 def get_client() -> OpenAI:
     if not SETTINGS.databricks_enabled:
         raise RuntimeError(
-            "Databricks não configurado: defina DATABRICKS_HOST e "
-            "DATABRICKS_TOKEN no .env (veja .env.example)."
+            "Databricks is not configured: set DATABRICKS_HOST and "
+            "DATABRICKS_TOKEN in .env (see .env.example)."
         )
     return OpenAI(
         api_key=SETTINGS.databricks_token,
@@ -101,25 +100,25 @@ def build_extraction_prompt(
         col_lines.append(line)
 
     parts = [
-        "Extraia do documento (cada imagem é uma página) os dados no "
-        "formato da tabela abaixo.",
-        "Colunas da tabela de destino:",
+        "Extract the data from the document (each image is one page) "
+        "following the layout of the table below.",
+        "Target table columns:",
         "\n".join(col_lines),
     ]
     if sample is not None and not sample.empty:
         parts.append(
-            "Exemplos de linhas reais da tabela (siga o mesmo formato "
-            "de datas, números e códigos):\n"
+            "Real sample rows from the table (follow the same formatting "
+            "for dates, numbers and codes):\n"
             + sample.head(5).to_csv(index=False)
         )
     parts.append(
-        "Responda APENAS com um array JSON de objetos - um objeto por "
-        "linha/registro identificado na imagem, com exatamente as chaves "
-        "acima (em maiúsculas). Use null para campos ausentes ou "
-        "ilegíveis. Não inclua explicações fora do JSON."
+        "Answer ONLY with a JSON array of objects - one object per "
+        "row/record identified in the document, with exactly the keys "
+        "above (uppercase). Use null for missing or illegible fields. "
+        "Do not include any explanation outside the JSON."
     )
     if extra_instructions.strip():
-        parts.append(f"Instruções adicionais do usuário: {extra_instructions.strip()}")
+        parts.append(f"Additional user instructions: {extra_instructions.strip()}")
     return "\n\n".join(parts)
 
 
@@ -136,13 +135,13 @@ def parse_rows_json(text: str, columns: Iterable[str]) -> pd.DataFrame:
     if not candidate.startswith("["):
         start, end = candidate.find("["), candidate.rfind("]")
         if start == -1 or end <= start:
-            raise ValueError("Nenhum array JSON encontrado na resposta do modelo.")
+            raise ValueError("No JSON array found in the model response.")
         candidate = candidate[start : end + 1]
     data = json.loads(candidate)
     if isinstance(data, dict):
         data = [data]
     if not isinstance(data, list):
-        raise ValueError("A resposta do modelo não é uma lista JSON.")
+        raise ValueError("The model response is not a JSON list.")
     df = pd.DataFrame(data)
     df.columns = [str(c).upper() for c in df.columns]
     ordered = [c for c in columns if c in df.columns]

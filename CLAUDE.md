@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-Streamlit app for document OCR: upload an image or PDF → Claude transcribes it (free-form markdown) or extracts structured rows matching a Snowflake table's schema → chat about the document → export CSV/Excel/markdown. UI text, prompts, and user-facing error messages are in Brazilian Portuguese — keep that convention.
+Streamlit app for document OCR: upload an image or PDF → Claude transcribes it (free-form markdown) or extracts structured rows matching a Snowflake table's schema → chat about the document → export CSV/Excel/markdown. UI text, prompts, and user-facing error messages are in English — keep that convention.
 
 ## Commands
 
@@ -24,7 +24,7 @@ Modules with one direction of dependency: `app.py` → `src/documents.py` + `src
 
 **LLM access is Claude via Databricks, not the Anthropic API.** `src/llm_client.py` uses the OpenAI SDK pointed at `{DATABRICKS_HOST}/serving-endpoints`, with the Databricks PAT as `api_key` and the serving endpoint name (e.g. `databricks-claude-sonnet-4-5`) as `model`. Messages and images use the OpenAI format (base64 data URIs via `image_content()`); Databricks forwards them to Claude. Don't switch to the `anthropic` SDK or Anthropic message format.
 
-**Everything the model sees is images.** `src/documents.py` normalizes an upload into `(bytes, mime)` pages: images pass through; PDFs are rendered page-by-page to PNG with PyMuPDF (capped at `MAX_PDF_PAGES`, ~144 dpi). Every model call (extraction, free OCR, chat) sends all pages as image parts — there is no text-layer PDF parsing.
+**Everything the model sees is images.** `src/documents.py` normalizes an upload into `(bytes, mime)` pages: images pass through; PDFs are rendered page-by-page to PNG with PyMuPDF (~144 dpi, capped at `PDF_MAX_PAGES`, 0 = unlimited). There is no text-layer PDF parsing. Extraction and free OCR run in batches of `PDF_PAGES_PER_CALL` pages per model call (`page_batches()` in `app.py`) to stay under the request size limit — extraction concatenates the per-batch DataFrames, OCR joins the per-batch markdown. Chat sends all pages in one call.
 
 **Two extraction modes**, chosen by a toggle in `app.py` (shown when a Snowflake table reference is loaded in `st.session_state.table_ref`; the sidebar prefills `SETTINGS.sf_default_table`):
 - *Free OCR* — streaming transcription to markdown (`stream_chat`).
