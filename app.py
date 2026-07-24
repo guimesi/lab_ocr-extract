@@ -268,7 +268,7 @@ with col_ocr:
                         f"{len(page_parts)})..."
                     )
                 with st.spinner(spinner):
-                    answer = llm_client.complete([
+                    answer, truncated = llm_client.complete([
                         {
                             "role": "user",
                             "content": [
@@ -277,6 +277,15 @@ with col_ocr:
                             ],
                         }
                     ])
+                if truncated:
+                    st.warning(
+                        f"Pages {first}-{last}: the response hit the "
+                        f"output-token limit ({SETTINGS.llm_max_tokens}); "
+                        "complete rows were recovered but the last ones may "
+                        "be missing. Raise LLM_MAX_TOKENS or lower "
+                        "PDF_PAGES_PER_CALL in .env to avoid this.",
+                        icon=":material/content_cut:",
+                    )
                 try:
                     df_batch = llm_client.parse_rows_json(
                         answer, schema["NAME"].tolist()

@@ -60,6 +60,7 @@ def stream_chat(messages: list[dict]) -> Iterator[str]:
     stream = client.chat.completions.create(
         model=SETTINGS.databricks_model,
         messages=[{"role": "system", "content": SYSTEM_PROMPT}, *messages],
+        max_tokens=SETTINGS.llm_max_tokens,
         stream=True,
     )
     for chunk in stream:
@@ -67,14 +68,21 @@ def stream_chat(messages: list[dict]) -> Iterator[str]:
             yield chunk.choices[0].delta.content
 
 
-def complete(messages: list[dict]) -> str:
-    """Non-streaming completion; returns the full text."""
+def complete(messages: list[dict]) -> tuple[str, bool]:
+    """Non-streaming completion.
+
+    Returns ``(text, truncated)`` - ``truncated`` is True when the
+    response hit the output-token limit (``finish_reason == "length"``),
+    meaning the tail of the answer is missing.
+    """
     client = get_client()
     resp = client.chat.completions.create(
         model=SETTINGS.databricks_model,
         messages=[{"role": "system", "content": SYSTEM_PROMPT}, *messages],
+        max_tokens=SETTINGS.llm_max_tokens,
     )
-    return resp.choices[0].message.content or ""
+    choice = resp.choices[0]
+    return choice.message.content or "", choice.finish_reason == "length"
 
 
 # =============================================================================
@@ -142,6 +150,26 @@ def build_extraction_prompt(
     return "\n\n".join(parts)
 
 
+def _repair_truncated_array(candidate: str) -> Optional[list]:
+    """Recover the complete row objects from a truncated JSON array.
+
+    When the response hits the output-token limit it stops mid-row; cut
+    the text back to the last fully closed object and close the array,
+    dropping the partial trailing row. Returns None when nothing
+    parseable can be recovered.
+    """
+    if not candidate.lstrip().startswith("["):
+        return None
+    end = candidate.rfind("}")
+    if end == -1:
+        return None
+    try:
+        data = json.loads(candidate[: end + 1].rstrip().rstrip(",") + "]")
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, list) else None
+
+
 def parse_rows_json(text: str, columns: Iterable[str]) -> pd.DataFrame:
     """Parse the model's JSON answer into a DataFrame with ``columns``.
 
@@ -160,9 +188,11 @@ def parse_rows_json(text: str, columns: Iterable[str]) -> pd.DataFrame:
     try:
         data = json.loads(candidate)
     except json.JSONDecodeError as exc:
-        raise ValueError(
-            f"Could not parse the model response as JSON ({exc.msg})."
-        ) from exc
+        data = _repair_truncated_array(candidate)
+        if data is None:
+            raise ValueError(
+                f"Could not parse the model response as JSON ({exc.msg})."
+            ) from exc
     if isinstance(data, dict):
         data = [data]
     if not isinstance(data, list):

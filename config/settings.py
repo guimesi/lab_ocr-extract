@@ -67,6 +67,11 @@ class Settings:
     pdf_max_pages: int = int(os.getenv("PDF_MAX_PAGES", "").strip() or "0")
     pdf_pages_per_call: int = int(os.getenv("PDF_PAGES_PER_CALL", "").strip() or "10")
 
+    # Output-token budget per model call. The Databricks endpoint default
+    # is low enough that dense extractions get cut off mid-JSON; set this
+    # high explicitly (Claude Sonnet supports far more than the default).
+    llm_max_tokens: int = int(os.getenv("LLM_MAX_TOKENS", "").strip() or "16000")
+
     @property
     def databricks_enabled(self) -> bool:
         return bool(self.databricks_host and self.databricks_token)
