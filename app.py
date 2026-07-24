@@ -213,7 +213,8 @@ with col_ocr:
                 except Exception:
                     sample = None  # sample is optional; the schema suffices
             base_prompt = llm_client.build_extraction_prompt(schema, sample, extra)
-            frames: list[pd.DataFrame] | None = []
+            frames: list[pd.DataFrame] = []
+            failed_ranges: list[str] = []
             for first, last, batch in batches:
                 prompt = base_prompt
                 spinner = "Extracting data from the document..."
@@ -242,13 +243,23 @@ with col_ocr:
                         llm_client.parse_rows_json(answer, schema["NAME"].tolist())
                     )
                 except ValueError as exc:
-                    st.error(f"{exc} (pages {first}-{last}) Raw response below:")
-                    st.code(answer)
-                    frames = None
-                    break
-            if frames is not None:
+                    failed_ranges.append(f"{first}-{last}")
+                    st.warning(
+                        f"Pages {first}-{last}: {exc} Skipping this batch.",
+                        icon=":material/warning:",
+                    )
+                    with st.expander(f"Raw response (pages {first}-{last})"):
+                        st.code(answer)
+            if frames:
                 st.session_state.extracted_df = pd.concat(frames, ignore_index=True)
                 st.session_state.ocr_text = None
+            if failed_ranges:
+                st.warning(
+                    "Some page ranges could not be parsed and were skipped: "
+                    f"{', '.join(failed_ranges)}. The result covers the "
+                    "remaining pages.",
+                    icon=":material/error:",
+                )
         else:
             base_prompt = (
                 "Transcribe the full content of the document to markdown, "

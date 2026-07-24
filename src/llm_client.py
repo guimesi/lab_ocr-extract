@@ -115,7 +115,9 @@ def build_extraction_prompt(
         "Answer ONLY with a JSON array of objects - one object per "
         "row/record identified in the document, with exactly the keys "
         "above (uppercase). Use null for missing or illegible fields. "
-        "Do not include any explanation outside the JSON."
+        "If nothing in these pages matches the target table, answer "
+        "with an empty array: []. Do not include any explanation "
+        "outside the JSON."
     )
     if extra_instructions.strip():
         parts.append(f"Additional user instructions: {extra_instructions.strip()}")
@@ -137,11 +139,18 @@ def parse_rows_json(text: str, columns: Iterable[str]) -> pd.DataFrame:
         if start == -1 or end <= start:
             raise ValueError("No JSON array found in the model response.")
         candidate = candidate[start : end + 1]
-    data = json.loads(candidate)
+    try:
+        data = json.loads(candidate)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"Could not parse the model response as JSON ({exc.msg})."
+        ) from exc
     if isinstance(data, dict):
         data = [data]
     if not isinstance(data, list):
         raise ValueError("The model response is not a JSON list.")
+    if not data:
+        return pd.DataFrame(columns=list(columns))
     df = pd.DataFrame(data)
     df.columns = [str(c).upper() for c in df.columns]
     ordered = [c for c in columns if c in df.columns]
