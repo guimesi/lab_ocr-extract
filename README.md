@@ -12,7 +12,7 @@ and structured extraction following a **Snowflake table** layout.
 2. **Free-form OCR** — faithful markdown transcription, preserving structure.
 3. **Extraction following a Snowflake table layout** — the sidebar comes
    prefilled with the default reference table
-   (`INSIGHTS_DB.UC_EPCDF_PRD_RSTR.GP_WWBS_HISTORICAL`, configurable via
+   (`INSIGHTS_DB.UC_EPCDF_PRD_RSTR.GP_WBS_HISTORICAL`, configurable via
    `SNOWFLAKE_DEFAULT_TABLE`); the app reads the schema (`DESCRIBE TABLE`)
    and a few sample rows, and the model returns the document data as rows of
    that table (JSON → editable DataFrame). A toggle switches between this
@@ -57,7 +57,7 @@ app still works with free-form OCR + chat.
 are shown to the model as formatting examples (0 = schema only).
 
 `SNOWFLAKE_DEFAULT_TABLE` sets the reference table suggested in the sidebar
-(default: `INSIGHTS_DB.UC_EPCDF_PRD_RSTR.GP_WWBS_HISTORICAL`).
+(default: `INSIGHTS_DB.UC_EPCDF_PRD_RSTR.GP_WBS_HISTORICAL`).
 
 ### PDF handling
 

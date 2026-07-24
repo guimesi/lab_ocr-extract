@@ -10,6 +10,8 @@ Run: streamlit run app.py
 from __future__ import annotations
 
 import io
+import re
+from pathlib import Path
 
 import pandas as pd
 import streamlit as st
@@ -54,6 +56,21 @@ def page_batches(parts: list[dict]) -> list[tuple[int, int, list[dict]]]:
         (i + 1, min(i + size, len(parts)), parts[i : i + size])
         for i in range(0, len(parts), size)
     ]
+
+
+_PROMPTS_DIR = Path(__file__).parent / "prompts"
+
+
+def available_guides() -> dict[str, Path]:
+    """Domain extraction guides shipped as ``prompts/*.md``, by stem."""
+    if not _PROMPTS_DIR.is_dir():
+        return {}
+    return {p.stem: p for p in sorted(_PROMPTS_DIR.glob("*.md"))}
+
+
+def _safe_name(value: object) -> str:
+    """Turn a group label into a filesystem/sheet-safe fragment."""
+    return re.sub(r"[^\w.-]+", "_", str(value)).strip("_") or "value"
 
 
 # =============================================================================
@@ -193,6 +210,26 @@ with col_ocr:
                 "transcription."
             ),
         )
+    guide_text = ""
+    guides = available_guides()
+    if structured and guides:
+        names = ["No guide", *guides]
+        table_name = st.session_state.table_ref.split(".")[-1].upper()
+        default_ix = next(
+            (i for i, n in enumerate(names) if n.upper() == table_name),
+            1 if len(guides) == 1 else 0,
+        )
+        choice = st.selectbox(
+            "Extraction guide (optional)",
+            names,
+            index=default_ix,
+            help=(
+                "Domain-specific instructions appended to the extraction "
+                "prompt - one guide per document type, from `prompts/*.md`."
+            ),
+        )
+        if choice != "No guide":
+            guide_text = guides[choice].read_text(encoding="utf-8")
     extra = st.text_area(
         "Additional instructions (optional)",
         placeholder="e.g. only consider the line-item table, ignore the footer",
@@ -212,7 +249,9 @@ with col_ocr:
                     )
                 except Exception:
                     sample = None  # sample is optional; the schema suffices
-            base_prompt = llm_client.build_extraction_prompt(schema, sample, extra)
+            base_prompt = llm_client.build_extraction_prompt(
+                schema, sample, extra, guide=guide_text, file_name=uploaded.name
+            )
             frames: list[pd.DataFrame] = []
             failed_ranges: list[str] = []
             for first, last, batch in batches:
@@ -329,13 +368,60 @@ if st.session_state.extracted_df is not None:
         num_rows="dynamic",
         key="result_editor",
     )
+
+    # Optional split into one table per value of a column (e.g. the
+    # WBS_VERSION key a domain guide asks the model to add when a
+    # document carries multiple versions of the same structure).
+    split_options = ["No split", *edited.columns.tolist()]
+    default_split = next(
+        (
+            c for c in edited.columns
+            if c.upper().endswith("_VERSION")
+            and edited[c].nunique(dropna=False) > 1
+        ),
+        None,
+    )
+    split_by = st.selectbox(
+        "Split the result into one table per value of (optional)",
+        split_options,
+        index=split_options.index(default_split) if default_split else 0,
+        help=(
+            "Shows one tab per distinct value, each with its own CSV; "
+            "the Excel export gets one sheet per table."
+        ),
+    )
+    groups: list[tuple[object, pd.DataFrame]] = []
+    if split_by != "No split":
+        groups = list(edited.groupby(split_by, dropna=False, sort=False))
+        tabs = st.tabs([f"{key} ({len(g)} rows)" for key, g in groups])
+        for tab, (key, group) in zip(tabs, groups):
+            with tab:
+                st.dataframe(group, width="stretch", hide_index=True)
+                st.download_button(
+                    f"Download CSV - {key}",
+                    group.to_csv(index=False).encode("utf-8-sig"),
+                    f"extraction_{_safe_name(key)}.csv",
+                    "text/csv",
+                    icon=":material/download:",
+                    key=f"dl_csv_{_safe_name(key)}",
+                )
+
     csv_bytes = edited.to_csv(index=False).encode("utf-8-sig")
     xlsx_buf = io.BytesIO()
     with pd.ExcelWriter(xlsx_buf, engine="openpyxl") as writer:
-        edited.to_excel(writer, index=False, sheet_name="extraction")
+        if groups:
+            used: set[str] = set()
+            for key, group in groups:
+                name = _safe_name(key)[:31]
+                while name.lower() in used:
+                    name = f"{name[:29]}_{len(used)}"
+                used.add(name.lower())
+                group.to_excel(writer, index=False, sheet_name=name)
+        else:
+            edited.to_excel(writer, index=False, sheet_name="extraction")
     col_a, col_b = st.columns(2)
     col_a.download_button(
-        "Download CSV", csv_bytes, "extraction.csv", "text/csv",
+        "Download CSV (all rows)", csv_bytes, "extraction.csv", "text/csv",
         icon=":material/download:", width="stretch",
     )
     col_b.download_button(

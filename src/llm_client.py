@@ -85,11 +85,16 @@ def build_extraction_prompt(
     schema: pd.DataFrame,
     sample: Optional[pd.DataFrame],
     extra_instructions: str = "",
+    guide: str = "",
+    file_name: str = "",
 ) -> str:
     """Prompt asking for a JSON array of rows matching the table columns.
 
     ``schema`` is the DataFrame returned by
     :meth:`src.snowflake_client.SnowflakeClient.describe_table`.
+    ``guide`` is optional domain guidance (a ``prompts/*.md`` file) that
+    teaches the model how this document type maps onto the columns; it
+    may add extra keys (e.g. a version label) on top of the schema.
     """
     col_lines = []
     for _, row in schema.iterrows():
@@ -111,15 +116,27 @@ def build_extraction_prompt(
             "for dates, numbers and codes):\n"
             + sample.head(5).to_csv(index=False)
         )
+    if file_name.strip():
+        parts.append(
+            f'Source file name: "{file_name.strip()}" - file names '
+            "sometimes encode metadata such as a project id."
+        )
     parts.append(
         "Answer ONLY with a JSON array of objects - one object per "
-        "row/record identified in the document, with exactly the keys "
-        "above (uppercase). Extract every record you can identify, even "
+        "row/record identified in the document, with the keys above "
+        "(uppercase). Extract every record you can identify, even "
         "if incomplete - use null for fields the document does not show "
         "or that are illegible. Only if the pages contain no extractable "
         "records at all, answer with an empty array: []. Do not include "
         "any explanation outside the JSON."
     )
+    if guide.strip():
+        parts.append(
+            "Domain guidance for this document type - follow it closely; "
+            "it explains where the data lives and how it maps onto the "
+            "columns, and it may add extra keys on top of the schema:\n\n"
+            + guide.strip()
+        )
     if extra_instructions.strip():
         parts.append(f"Additional user instructions: {extra_instructions.strip()}")
     return "\n\n".join(parts)

@@ -58,7 +58,7 @@ class Settings:
     # Reference table offered by default in the sidebar; the structured
     # extraction follows this table's columns and types.
     sf_default_table: str = os.getenv(
-        "SNOWFLAKE_DEFAULT_TABLE", "INSIGHTS_DB.UC_EPCDF_PRD_RSTR.GP_WWBS_HISTORICAL"
+        "SNOWFLAKE_DEFAULT_TABLE", "INSIGHTS_DB.UC_EPCDF_PRD_RSTR.GP_WBS_HISTORICAL"
     )
 
     # PDF handling: how many pages to render (0 = no limit) and how many
