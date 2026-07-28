@@ -1,28 +1,24 @@
 """
-OCR Extract - Streamlit app.
+Doc Patterns - Streamlit app (variation of OCR Extract).
 
-Upload an image or PDF -> OCR with Claude (via Databricks serving
-endpoint, OpenAI SDK) -> chat about the document -> structured
-extraction following a Snowflake table schema -> CSV / Excel export.
+Upload several (large) PDFs of the same document kind -> Claude
+analyzes each one's structure and patterns, in page batches (via
+Databricks serving endpoint, OpenAI SDK) -> chat about the documents
+grounded in those analyses -> generate a template / authoring guide
+for writing a new document like them.
 
 Run: streamlit run app.py
 """
 from __future__ import annotations
 
-import io
-import re
-from pathlib import Path
-
-import pandas as pd
 import streamlit as st
 
 from config.settings import SETTINGS
-from src import documents, llm_client
-from src.snowflake_client import get_shared_client, qualify
+from src import documents, llm_client, patterns
 
 st.set_page_config(
-    page_title="OCR Extract",
-    page_icon=":material/document_scanner:",
+    page_title="Doc Patterns",
+    page_icon=":material/description:",
     layout="wide",
 )
 
@@ -30,16 +26,6 @@ st.set_page_config(
 # =============================================================================
 # Cached data access
 # =============================================================================
-
-@st.cache_data(ttl=600, show_spinner="Reading schema from Snowflake...")
-def load_table_schema(table_ref: str) -> pd.DataFrame:
-    return get_shared_client().describe_table(table_ref)
-
-
-@st.cache_data(ttl=600, show_spinner="Fetching sample rows...")
-def load_table_sample(table_ref: str, limit: int) -> pd.DataFrame:
-    return get_shared_client().fetch_sample(table_ref, limit=limit)
-
 
 @st.cache_data(ttl=600, show_spinner="Preparing the document...")
 def load_document_pages(
@@ -58,31 +44,14 @@ def page_batches(parts: list[dict]) -> list[tuple[int, int, list[dict]]]:
     ]
 
 
-_PROMPTS_DIR = Path(__file__).parent / "prompts"
-
-
-def available_guides() -> dict[str, Path]:
-    """Domain extraction guides shipped as ``prompts/*.md``, by stem."""
-    if not _PROMPTS_DIR.is_dir():
-        return {}
-    return {p.stem: p for p in sorted(_PROMPTS_DIR.glob("*.md"))}
-
-
-def _safe_name(value: object) -> str:
-    """Turn a group label into a filesystem/sheet-safe fragment."""
-    return re.sub(r"[^\w.-]+", "_", str(value)).strip("_") or "value"
-
-
 # =============================================================================
 # Session state
 # =============================================================================
 
 _DEFAULTS = {
-    "messages": [],          # visible chat history: {"role", "content"}
-    "ocr_text": None,        # free-form OCR transcription (str)
-    "extracted_df": None,    # structured extraction (DataFrame)
-    "table_ref": "",         # qualified table reference in use
-    "image_key": None,       # id of the current upload, to detect changes
+    "messages": [],       # visible chat history: {"role", "content"}
+    "profiles": None,     # per-document analysis: {file name: markdown}
+    "docs_key": None,     # ids of the current uploads, to detect changes
 }
 for key, default in _DEFAULTS.items():
     st.session_state.setdefault(key, default)
@@ -90,19 +59,26 @@ for key, default in _DEFAULTS.items():
 
 def reset_results() -> None:
     st.session_state.messages = []
-    st.session_state.ocr_text = None
-    st.session_state.extracted_df = None
+    st.session_state.profiles = None
 
 
 # =============================================================================
-# Sidebar: connection status + Snowflake table reference
+# Sidebar: connection status
 # =============================================================================
 
 with st.sidebar:
-    st.title(":material/document_scanner: OCR Extract")
+    st.title(":material/description: Doc Patterns")
+    st.caption(
+        "Upload reference documents of the same kind; the model analyzes "
+        "their structure and patterns so you can chat about them and "
+        "generate an authoring template for new documents."
+    )
 
     if SETTINGS.databricks_enabled:
-        st.success(f"Databricks: `{SETTINGS.databricks_model}`", icon=":material/cloud_done:")
+        st.success(
+            f"Databricks: `{SETTINGS.databricks_model}`",
+            icon=":material/cloud_done:",
+        )
     else:
         st.error(
             "Databricks is not configured. Set DATABRICKS_HOST and "
@@ -111,394 +87,205 @@ with st.sidebar:
         )
 
     st.divider()
-    st.subheader("Reference table (optional)")
     st.caption(
-        "Point to a Snowflake table so the OCR extracts data matching "
-        "its layout (columns and types)."
+        f"Documents are analyzed {SETTINGS.pdf_pages_per_call} page(s) "
+        "per model call (PDF_PAGES_PER_CALL); large PDFs take one call "
+        "per batch plus one to consolidate."
     )
 
-    if not SETTINGS.snowflake_enabled:
-        st.info(
-            "Snowflake is not configured in `.env` - OCR will produce a "
-            "free-form transcription.",
-            icon=":material/database_off:",
-        )
-    else:
-        table_input = st.text_input(
-            "Table (NAME, SCHEMA.NAME or DB.SCHEMA.NAME)",
-            value=st.session_state.table_ref or SETTINGS.sf_default_table,
-            placeholder="e.g. DB.SCHEMA.TABLE",
-        )
-        col_load, col_clear = st.columns(2)
-        if col_load.button("Load schema", width="stretch", type="primary"):
-            try:
-                ref = qualify(table_input)
-                load_table_schema.clear()
-                load_table_sample.clear()
-                load_table_schema(ref)  # validates + warms the cache
-                st.session_state.table_ref = ref
-                st.session_state.extracted_df = None
-            except Exception as exc:
-                st.error(f"Failed to load the table: {exc}")
-        if col_clear.button("Clear", width="stretch"):
-            st.session_state.table_ref = ""
-            st.session_state.extracted_df = None
-
-        if st.session_state.table_ref:
-            st.success(f"Using `{st.session_state.table_ref}`", icon=":material/table:")
-            with st.expander("Table columns"):
-                st.dataframe(
-                    load_table_schema(st.session_state.table_ref),
-                    width="stretch",
-                    hide_index=True,
-                )
-
 
 # =============================================================================
-# Main: upload + OCR
+# 1. Reference documents
 # =============================================================================
 
-st.header("1. Document", divider="gray")
+st.header("1. Reference documents", divider="gray")
 
-uploaded = st.file_uploader(
-    "Upload an image or PDF (invoice, receipt, table, form...)",
-    type=["png", "jpg", "jpeg", "webp", "gif", "pdf"],
+uploads = st.file_uploader(
+    "Upload the reference documents (PDFs or images) - ideally several "
+    "examples of the same document kind.",
+    type=["pdf", "png", "jpg", "jpeg", "webp", "gif"],
+    accept_multiple_files=True,
 )
 
-if uploaded is None:
-    st.session_state.image_key = None
+if not uploads:
+    st.session_state.docs_key = None
     reset_results()
-    st.info("Upload an image or PDF to get started.", icon=":material/upload_file:")
+    st.info(
+        "Upload one or more documents to get started.",
+        icon=":material/upload_file:",
+    )
     st.stop()
 
-# New file replaces previous results / conversation
-if st.session_state.image_key != uploaded.file_id:
-    st.session_state.image_key = uploaded.file_id
+# A change in the set of files replaces previous results / conversation.
+docs_key = tuple(f.file_id for f in uploads)
+if st.session_state.docs_key != docs_key:
+    st.session_state.docs_key = docs_key
     reset_results()
 
-file_bytes = uploaded.getvalue()
-mime_type = uploaded.type or "image/png"
-pages, total_pages = load_document_pages(file_bytes, mime_type)
-if total_pages > len(pages):
-    st.warning(
-        f"The PDF has {total_pages} pages; only the first {len(pages)} "
-        "will be processed (PDF_MAX_PAGES).",
-        icon=":material/warning:",
-    )
-
-# One image content part per page, reused in every model call.
-page_parts = [llm_client.image_content(b, m) for b, m in pages]
-
-col_img, col_ocr = st.columns([2, 3], gap="large")
-
-with col_img:
-    st.image(pages[0][0], caption=uploaded.name, width="stretch")
-    if len(pages) > 1:
-        with st.expander(f"View all {len(pages)} pages"):
-            for i, (page_bytes, _) in enumerate(pages, start=1):
-                st.image(page_bytes, caption=f"Page {i}", width="stretch")
-
-with col_ocr:
-    structured = False
-    if st.session_state.table_ref:
-        structured = st.toggle(
-            "Extract following the reference table layout",
-            value=True,
-            help=(
-                f"Fills the columns of `{st.session_state.table_ref}` with "
-                "data from the document. Turn off for a free-form markdown "
-                "transcription."
-            ),
+# Load pages for every document up front (cached per file content).
+docs: list[tuple[str, list[tuple[bytes, str]], int]] = []
+total_calls = 0
+for f in uploads:
+    pages, total = load_document_pages(f.getvalue(), f.type or "image/png")
+    if total > len(pages):
+        st.warning(
+            f"{f.name}: the PDF has {total} pages; only the first "
+            f"{len(pages)} will be processed (PDF_MAX_PAGES).",
+            icon=":material/warning:",
         )
-    guide_text = ""
-    guides = available_guides()
-    if structured and guides:
-        names = ["No guide", *guides]
-        table_name = st.session_state.table_ref.split(".")[-1].upper()
-        default_ix = next(
-            (i for i, n in enumerate(names) if n.upper() == table_name),
-            1 if len(guides) == 1 else 0,
-        )
-        choice = st.selectbox(
-            "Extraction guide (optional)",
-            names,
-            index=default_ix,
-            help=(
-                "Domain-specific instructions appended to the extraction "
-                "prompt - one guide per document type, from `prompts/*.md`."
-            ),
-        )
-        if choice != "No guide":
-            guide_text = guides[choice].read_text(encoding="utf-8")
-    extra = st.text_area(
-        "Additional instructions (optional)",
-        placeholder="e.g. only consider the line-item table, ignore the footer",
-    )
-    label = (
-        "Extract to table layout" if structured else "Run OCR (transcription)"
-    )
-    if st.button(label, type="primary", icon=":material/document_scanner:"):
-        batches = page_batches(page_parts)
-        if structured:
-            schema = load_table_schema(st.session_state.table_ref)
-            sample = None
-            if SETTINGS.sf_sample_rows > 0:
-                try:
-                    sample = load_table_sample(
-                        st.session_state.table_ref, SETTINGS.sf_sample_rows
-                    )
-                except Exception:
-                    sample = None  # sample is optional; the schema suffices
-            base_prompt = llm_client.build_extraction_prompt(
-                schema, sample, extra, guide=guide_text, file_name=uploaded.name
-            )
-            frames: list[pd.DataFrame] = []
-            failed_ranges: list[str] = []
-            for first, last, batch in batches:
-                prompt = base_prompt
-                spinner = "Extracting data from the document..."
-                if len(batches) > 1:
-                    prompt += (
-                        f"\n\nThe attached images are pages {first}-{last} of a "
-                        f"{len(page_parts)}-page document; extract only what is "
-                        "visible in them."
-                    )
-                    spinner = (
-                        f"Extracting data (pages {first}-{last} of "
-                        f"{len(page_parts)})..."
-                    )
-                with st.spinner(spinner):
-                    answer, truncated = llm_client.complete([
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "text", "text": prompt},
-                                *batch,
-                            ],
-                        }
-                    ])
-                if truncated:
-                    st.warning(
-                        f"Pages {first}-{last}: the response hit the "
-                        f"output-token limit ({SETTINGS.llm_max_tokens}); "
-                        "complete rows were recovered but the last ones may "
-                        "be missing. Raise LLM_MAX_TOKENS or lower "
-                        "PDF_PAGES_PER_CALL in .env to avoid this.",
-                        icon=":material/content_cut:",
-                    )
-                try:
-                    df_batch = llm_client.parse_rows_json(
-                        answer, schema["NAME"].tolist()
-                    )
-                    frames.append(df_batch)
-                    if df_batch.empty:
-                        st.info(
-                            f"Pages {first}-{last}: no matching records found.",
-                            icon=":material/info:",
-                        )
-                        with st.expander(f"Raw response (pages {first}-{last})"):
-                            st.code(answer)
-                except ValueError as exc:
-                    failed_ranges.append(f"{first}-{last}")
-                    st.warning(
-                        f"Pages {first}-{last}: {exc} Skipping this batch.",
-                        icon=":material/warning:",
-                    )
-                    with st.expander(f"Raw response (pages {first}-{last})"):
-                        st.code(answer)
-            if frames:
-                result = pd.concat(frames, ignore_index=True)
-                st.session_state.extracted_df = result
-                st.session_state.ocr_text = None
-                if result.empty:
-                    st.info(
-                        "The model found no records matching the reference "
-                        "table in any page. Check the raw responses above to "
-                        "see its reasoning, and consider pointing it to the "
-                        "right content via 'Additional instructions' (e.g. "
-                        "'the WBS table starts on page 12').",
-                        icon=":material/search_off:",
-                    )
-            if failed_ranges:
-                st.warning(
-                    "Some page ranges could not be parsed and were skipped: "
-                    f"{', '.join(failed_ranges)}. The result covers the "
-                    "remaining pages.",
-                    icon=":material/error:",
+    docs.append((f.name, pages, total))
+    n_batches = len(page_batches([None] * len(pages)))
+    total_calls += n_batches + (1 if n_batches > 1 else 0)
+
+st.caption(
+    f"{len(docs)} document(s), "
+    f"{sum(len(pages) for _, pages, _ in docs)} page(s) in total - "
+    f"the analysis will take about {total_calls} model call(s)."
+)
+with st.expander("Preview (first page of each document)"):
+    cols = st.columns(min(len(docs), 4))
+    for i, (name, pages, total) in enumerate(docs):
+        with cols[i % len(cols)]:
+            st.image(pages[0][0], caption=f"{name} ({total} pages)", width="stretch")
+
+if st.button(
+    "Analyze documents", type="primary", icon=":material/manage_search:"
+):
+    profiles: dict[str, str] = {}
+    failed: list[str] = []
+    for name, pages, _ in docs:
+        parts = [llm_client.image_content(b, m) for b, m in pages]
+        with st.status(f"Analyzing {name}...", expanded=False) as status:
+            try:
+                profiles[name] = patterns.analyze_document(
+                    name,
+                    len(parts),
+                    page_batches(parts),
+                    progress=lambda msg, s=status: s.update(label=msg),
                 )
-        else:
-            base_prompt = (
-                "Transcribe the full content of the document to markdown, "
-                "preserving its structure (headings, tables, fields). "
-                "Each image is one page; transcribe them in order. "
-                "Mark illegible fragments as [illegible]."
-            )
-            if extra.strip():
-                base_prompt += f"\n\nAdditional instructions: {extra.strip()}"
-            texts: list[str] = []
-            with st.chat_message("assistant"):
-                for first, last, batch in batches:
-                    prompt = base_prompt
-                    if len(batches) > 1:
-                        prompt += (
-                            f"\n\nThe attached images are pages {first}-{last} "
-                            f"of a {len(page_parts)}-page document; transcribe "
-                            "only these pages, without any preamble."
-                        )
-                    texts.append(
-                        st.write_stream(
-                            llm_client.stream_chat([
-                                {
-                                    "role": "user",
-                                    "content": [
-                                        {"type": "text", "text": prompt},
-                                        *batch,
-                                    ],
-                                }
-                            ])
-                        )
-                    )
-            st.session_state.ocr_text = "\n\n".join(texts)
-            st.session_state.extracted_df = None
+                status.update(label=f"{name}: analyzed", state="complete")
+            except Exception as exc:
+                failed.append(name)
+                status.update(
+                    label=f"{name}: analysis failed ({exc})", state="error"
+                )
+    if failed:
+        st.warning(
+            "Some documents could not be analyzed and were skipped: "
+            f"{', '.join(failed)}.",
+            icon=":material/error:",
+        )
+    if profiles:
+        st.session_state.profiles = profiles
+        st.session_state.messages = []
 
 
 # =============================================================================
-# Results + export
+# 2. Analyses
 # =============================================================================
 
-if st.session_state.extracted_df is not None or st.session_state.ocr_text:
-    st.header("2. Result", divider="gray")
-
-if st.session_state.extracted_df is not None:
-    st.caption("Review and edit the values before exporting.")
-    edited = st.data_editor(
-        st.session_state.extracted_df,
-        width="stretch",
-        num_rows="dynamic",
-        key="result_editor",
+profiles = st.session_state.profiles
+if profiles:
+    st.header("2. Document analyses", divider="gray")
+    st.caption(
+        "One structural profile per document - this is the context the "
+        "chat reasons over."
     )
-
-    # Optional split into one table per value of a column (e.g. the
-    # WBS_VERSION key a domain guide asks the model to add when a
-    # document carries multiple versions of the same structure).
-    split_options = ["No split", *edited.columns.tolist()]
-    default_split = next(
-        (
-            c for c in edited.columns
-            if c.upper().endswith("_VERSION")
-            and edited[c].nunique(dropna=False) > 1
-        ),
-        None,
+    for name, profile in profiles.items():
+        with st.expander(f":material/description: {name}"):
+            st.markdown(profile)
+    combined = "\n\n---\n\n".join(
+        f"# {name}\n\n{profile}" for name, profile in profiles.items()
     )
-    split_by = st.selectbox(
-        "Split the result into one table per value of (optional)",
-        split_options,
-        index=split_options.index(default_split) if default_split else 0,
-        help=(
-            "Shows one tab per distinct value, each with its own CSV; "
-            "the Excel export gets one sheet per table."
-        ),
-    )
-    groups: list[tuple[object, pd.DataFrame]] = []
-    if split_by != "No split":
-        groups = list(edited.groupby(split_by, dropna=False, sort=False))
-        tabs = st.tabs([f"{key} ({len(g)} rows)" for key, g in groups])
-        for tab, (key, group) in zip(tabs, groups):
-            with tab:
-                st.dataframe(group, width="stretch", hide_index=True)
-                st.download_button(
-                    f"Download CSV - {key}",
-                    group.to_csv(index=False).encode("utf-8-sig"),
-                    f"extraction_{_safe_name(key)}.csv",
-                    "text/csv",
-                    icon=":material/download:",
-                    key=f"dl_csv_{_safe_name(key)}",
-                )
-
-    csv_bytes = edited.to_csv(index=False).encode("utf-8-sig")
-    xlsx_buf = io.BytesIO()
-    with pd.ExcelWriter(xlsx_buf, engine="openpyxl") as writer:
-        if groups:
-            used: set[str] = set()
-            for key, group in groups:
-                name = _safe_name(key)[:31]
-                while name.lower() in used:
-                    name = f"{name[:29]}_{len(used)}"
-                used.add(name.lower())
-                group.to_excel(writer, index=False, sheet_name=name)
-        else:
-            edited.to_excel(writer, index=False, sheet_name="extraction")
-    col_a, col_b = st.columns(2)
-    col_a.download_button(
-        "Download CSV (all rows)", csv_bytes, "extraction.csv", "text/csv",
-        icon=":material/download:", width="stretch",
-    )
-    col_b.download_button(
-        "Download Excel", xlsx_buf.getvalue(), "extraction.xlsx",
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        icon=":material/download:", width="stretch",
-    )
-elif st.session_state.ocr_text:
-    st.markdown(st.session_state.ocr_text)
     st.download_button(
-        "Download transcription (.md)",
-        st.session_state.ocr_text.encode("utf-8"),
-        "transcription.md",
+        "Download all analyses (.md)",
+        combined.encode("utf-8"),
+        "document_analyses.md",
         "text/markdown",
         icon=":material/download:",
     )
 
 
 # =============================================================================
-# Chat about the document
+# 3. Chat + template generation
 # =============================================================================
 
-st.header("3. Chat about the document", divider="gray")
+st.header("3. Chat about the documents", divider="gray")
+
+if not profiles:
+    st.info(
+        "Run the analysis first - the chat answers based on the "
+        "document profiles.",
+        icon=":material/manage_search:",
+    )
+    st.stop()
 
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.write(msg["content"])
 
-if prompt := st.chat_input("Ask something about the document...", submit_mode="disable"):
+prompt = st.chat_input(
+    "Ask about the documents, their patterns, or how to write a new one...",
+    submit_mode="disable",
+)
+if st.button(
+    "Generate authoring template",
+    icon=":material/edit_document:",
+    help=(
+        "Asks the model for a complete template: required sections, "
+        "formatting and data conventions, style guidance, a fill-in "
+        "skeleton and a validation checklist."
+    ),
+):
+    prompt = patterns.TEMPLATE_REQUEST
+
+if prompt:
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.write(prompt)
 
-    # API messages: the document pages (and any prior result) go as
-    # context in the first user turn; the visible history follows as
-    # plain text.
-    context_parts: list[str] = [
-        "This is the document under analysis (one image per page)."
+    # API messages: the document profiles (plus one first-page image per
+    # document, as visual reference) go as context in the first user
+    # turn; the visible history follows as plain text. Raw pages are NOT
+    # sent - five large PDFs would not fit one request.
+    context_content: list[dict] = [
+        {"type": "text", "text": patterns.chat_context(profiles)}
     ]
-    if st.session_state.ocr_text:
-        context_parts.append(
-            "OCR transcription already produced:\n" + st.session_state.ocr_text
+    for name, pages, _ in docs:
+        context_content.append(
+            {"type": "text", "text": f'First page of "{name}":'}
         )
-    if st.session_state.extracted_df is not None:
-        context_parts.append(
-            "Data already extracted (CSV):\n"
-            + st.session_state.extracted_df.to_csv(index=False)
-        )
+        context_content.append(llm_client.image_content(*pages[0]))
     api_messages: list[dict] = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": "\n\n".join(context_parts)},
-                *page_parts,
-            ],
-        },
+        {"role": "user", "content": context_content},
         {
             "role": "assistant",
-            "content": "Understood. I am looking at the document. What would you like to know?",
+            "content": (
+                "Understood. I have the analysis profiles of every "
+                "reference document. What would you like to know?"
+            ),
         },
         *st.session_state.messages,
     ]
 
     with st.chat_message("assistant"):
         try:
-            response = st.write_stream(llm_client.stream_chat(api_messages))
+            response = st.write_stream(
+                llm_client.stream_chat(
+                    api_messages, system=patterns.ANALYST_SYSTEM_PROMPT
+                )
+            )
         except Exception as exc:
             st.error(f"Error calling the model: {exc}")
             st.session_state.messages.pop()
             st.stop()
     st.session_state.messages.append({"role": "assistant", "content": response})
+
+if st.session_state.messages and st.session_state.messages[-1]["role"] == "assistant":
+    st.download_button(
+        "Download last answer (.md)",
+        str(st.session_state.messages[-1]["content"]).encode("utf-8"),
+        "answer.md",
+        "text/markdown",
+        icon=":material/download:",
+    )

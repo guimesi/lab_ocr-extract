@@ -1,26 +1,30 @@
-# OCR Extract
+# Doc Patterns (variation of OCR Extract)
 
-Streamlit app for document OCR with **Claude via Databricks** (Foundation
-Model API, consumed through the **OpenAI SDK**), with chat about the document
-and structured extraction following a **Snowflake table** layout.
+Streamlit app that learns the *pattern* of a document kind from examples,
+with **Claude via Databricks** (Foundation Model API, consumed through the
+**OpenAI SDK**). Upload several (large) PDFs of the same kind → the model
+analyzes each one's structure and conventions → chat about the documents →
+generate a complete **authoring template** for writing a new one like them.
+
+> This branch (`doc-pattern-chat`) is a variation of the original OCR
+> Extract app (branch `master`), which focuses on OCR + structured
+> extraction into a Snowflake table layout.
 
 ## Features
 
-1. **Image or PDF upload** (invoice, receipt, table, form, screenshot...).
-   PDFs are rendered page by page into images (PyMuPDF); all pages go to the
-   model, in batches for large files.
-2. **Free-form OCR** — faithful markdown transcription, preserving structure.
-3. **Extraction following a Snowflake table layout** — the sidebar comes
-   prefilled with the default reference table
-   (`INSIGHTS_DB.UC_EPCDF_PRD_RSTR.GP_WBS_HISTORICAL`, configurable via
-   `SNOWFLAKE_DEFAULT_TABLE`); the app reads the schema (`DESCRIBE TABLE`)
-   and a few sample rows, and the model returns the document data as rows of
-   that table (JSON → editable DataFrame). A toggle switches between this
-   structured extraction and the free-form transcription.
-4. **Chat** — talk to the model about the document (the pages and any
-   extracted results are sent as context).
-5. **Export** — CSV / Excel for the structured extraction (after review in
-   the editor) or `.md` for the transcription.
+1. **Multi-document upload** (PDFs or images) — ideally ~5 examples of the
+   same document kind. PDFs are rendered page by page into images (PyMuPDF).
+2. **Pattern analysis** — each document is analyzed in page batches (one
+   model call per batch, plus one consolidation call for large PDFs),
+   producing a markdown *profile* per document: structure, sections, layout,
+   formatting, data conventions, style. Profiles are shown and downloadable.
+3. **Chat grounded in the analyses** — the chat context is the document
+   profiles (plus one first-page image per document for visual reference),
+   not the raw pages, so any number/size of PDFs keeps working.
+4. **Template generation** — one click asks the model for a full authoring
+   guide: required sections, formatting and data conventions, style, a
+   fill-in-the-blanks skeleton and a validation checklist. Any answer can be
+   downloaded as `.md`.
 
 ## Setup
 
@@ -46,41 +50,36 @@ The OpenAI SDK points to `{DATABRICKS_HOST}/serving-endpoints`, with the PAT
 as `api_key` and the endpoint name as `model`. The endpoint must accept image
 input (the pay-per-token Claude endpoints do).
 
-### Snowflake (optional — enables the reference table)
-
-`SNOWFLAKE_ACCOUNT`, `SNOWFLAKE_USER`,
-`SNOWFLAKE_AUTHENTICATOR=externalbrowser`, `SNOWFLAKE_WAREHOUSE`,
-`SNOWFLAKE_DATABASE`, `SNOWFLAKE_SCHEMA`, `SNOWFLAKE_ROLE`. Without them the
-app still works with free-form OCR + chat.
-
-`SNOWFLAKE_SAMPLE_ROWS` (default 5) controls how many real rows of the table
-are shown to the model as formatting examples (0 = schema only).
-
-`SNOWFLAKE_DEFAULT_TABLE` sets the reference table suggested in the sidebar
-(default: `INSIGHTS_DB.UC_EPCDF_PRD_RSTR.GP_WBS_HISTORICAL`).
-
 ### PDF handling
 
 `PDF_MAX_PAGES` (default 0 = no limit) caps how many pages are rendered.
 `PDF_PAGES_PER_CALL` (default 10) controls how many pages go to the model per
-call — large PDFs are processed in batches and the results concatenated.
+analysis call — large PDFs are analyzed in batches and the notes consolidated.
+`LLM_MAX_TOKENS` (default 16000) is the output budget per call; raise it if
+analyses or templates come back truncated.
+
+### Snowflake (unused on this branch)
+
+The Snowflake variables and `src/snowflake_client.py` are kept for easy
+merging with `master`, but this app does not use them.
 
 ## Structure
 
 ```
-app.py                    # Streamlit UI (upload, OCR, chat, export)
+app.py                    # Streamlit UI (upload, analysis, chat, template)
 config/settings.py        # settings via .env
 src/documents.py          # image/PDF -> pages (PyMuPDF)
-src/llm_client.py         # Claude via Databricks (OpenAI SDK) + prompts + JSON parsing
-src/snowflake_client.py   # Snowflake connection (adapted from lab_data-quali-score)
+src/llm_client.py         # Claude via Databricks (OpenAI SDK)
+src/patterns.py           # per-document map-reduce analysis + chat/template prompts
+src/snowflake_client.py   # unused here (kept from master)
 ```
 
 ## Notes
 
-- The Snowflake connection uses `externalbrowser` by default (opens the
-  browser on the first query) and is shared process-wide to avoid repeated
-  authentications.
-- The model is instructed to **never invent values**: illegible fields become
-  `null` in the structured extraction and `[illegible]` in the transcription.
-- Always review the extraction in the editor before exporting — LLM OCR is
-  good, but not infallible.
+- The model is instructed to **stay grounded**: it quotes real section
+  titles and labels, marks illegible fragments as `[illegible]`, and never
+  invents content.
+- The chat never receives the raw pages of every document — only the
+  analysis profiles and one first-page image per document — so re-run the
+  analysis if you need details the profiles missed (or point the model at
+  them via chat and re-analyze).

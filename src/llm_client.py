@@ -50,16 +50,22 @@ def image_content(image_bytes: bytes, mime_type: str) -> dict:
     }
 
 
-def stream_chat(messages: list[dict]) -> Iterator[str]:
+def stream_chat(
+    messages: list[dict], system: Optional[str] = None
+) -> Iterator[str]:
     """Stream a chat completion, yielding text deltas.
 
     ``messages`` follow the OpenAI format; the system prompt is
-    prepended here so callers only manage the visible conversation.
+    prepended here so callers only manage the visible conversation
+    (``system`` overrides the default OCR-oriented prompt).
     """
     client = get_client()
     stream = client.chat.completions.create(
         model=SETTINGS.databricks_model,
-        messages=[{"role": "system", "content": SYSTEM_PROMPT}, *messages],
+        messages=[
+            {"role": "system", "content": system or SYSTEM_PROMPT},
+            *messages,
+        ],
         max_tokens=SETTINGS.llm_max_tokens,
         stream=True,
     )
@@ -68,17 +74,23 @@ def stream_chat(messages: list[dict]) -> Iterator[str]:
             yield chunk.choices[0].delta.content
 
 
-def complete(messages: list[dict]) -> tuple[str, bool]:
+def complete(
+    messages: list[dict], system: Optional[str] = None
+) -> tuple[str, bool]:
     """Non-streaming completion.
 
     Returns ``(text, truncated)`` - ``truncated`` is True when the
     response hit the output-token limit (``finish_reason == "length"``),
-    meaning the tail of the answer is missing.
+    meaning the tail of the answer is missing. ``system`` overrides the
+    default OCR-oriented system prompt.
     """
     client = get_client()
     resp = client.chat.completions.create(
         model=SETTINGS.databricks_model,
-        messages=[{"role": "system", "content": SYSTEM_PROMPT}, *messages],
+        messages=[
+            {"role": "system", "content": system or SYSTEM_PROMPT},
+            *messages,
+        ],
         max_tokens=SETTINGS.llm_max_tokens,
     )
     choice = resp.choices[0]
