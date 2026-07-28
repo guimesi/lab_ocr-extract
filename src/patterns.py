@@ -3,14 +3,21 @@ Cross-document pattern analysis for the template-authoring variation.
 
 Everything the model sees is images, and several large PDFs never fit
 one request - so each document goes through a map-reduce pass: page
-batches are analyzed one model call at a time ("map"), then the
-per-batch notes are consolidated into a single markdown *document
-profile* ("reduce"). Chat and template generation run over those text
-profiles instead of raw pages, which keeps the chat request size flat
-no matter how many or how large the PDFs are.
+batches are analyzed one model call each ("map"), then the per-batch
+notes are consolidated into a single markdown *document profile*
+("reduce"). Chat and template generation run over those text profiles
+instead of raw pages, which keeps the chat request size flat no matter
+how many or how large the PDFs are.
+
+``analyze_documents`` orchestrates the whole run in parallel: every
+page batch of every document goes into one shared queue served by
+``LLM_CONCURRENCY`` worker threads (the calls are pure I/O), and a
+document's consolidation call is submitted as soon as *its* batches
+finish - no document waits for the others.
 """
 from __future__ import annotations
 
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from typing import Callable, Optional
 
 from src import llm_client
@@ -90,78 +97,160 @@ def _consolidation_prompt(doc_name: str, total: int) -> str:
     )
 
 
-def analyze_document(
-    doc_name: str,
-    total_pages: int,
-    batches: list[tuple[int, int, list[dict]]],
-    progress: Optional[Callable[[str], None]] = None,
-) -> str:
-    """Analyze one document and return its markdown profile.
-
-    ``batches`` is the output of ``page_batches()`` in ``app.py``:
-    ``(first, last, image_parts)`` tuples, one model call each. With a
-    single batch its notes are the profile; otherwise a final call
-    consolidates the per-batch notes.
-    """
-    notes: list[tuple[int, int, str]] = []
-    for first, last, parts in batches:
-        if progress:
-            progress(
-                f"Analyzing {doc_name} - pages {first}-{last} of "
-                f"{total_pages}..."
-            )
+def _complete_with_retry(messages: list[dict], truncation_note: str) -> str:
+    """One analysis call, retried once on any error (transient network /
+    throttling hiccups are common when several calls run in parallel)."""
+    try:
         text, truncated = llm_client.complete(
-            [
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": _batch_prompt(
-                                doc_name, first, last, total_pages
-                            ),
-                        },
-                        *parts,
-                    ],
-                }
-            ],
-            system=ANALYST_SYSTEM_PROMPT,
+            messages, system=ANALYST_SYSTEM_PROMPT
         )
-        if truncated:
-            text += (
-                "\n\n[Note: these notes hit the output-token limit and "
-                "may be missing their tail.]"
-            )
-        notes.append((first, last, text))
+    except Exception:
+        text, truncated = llm_client.complete(
+            messages, system=ANALYST_SYSTEM_PROMPT
+        )
+    if truncated:
+        text += f"\n\n[Note: {truncation_note}]"
+    return text
 
-    if len(notes) == 1:
-        return notes[0][2]
 
-    if progress:
-        progress(f"Consolidating the analysis of {doc_name}...")
-    joined = "\n\n".join(
-        f"### Notes for pages {first}-{last}\n\n{text}"
-        for first, last, text in notes
+def _batch_notes(
+    doc_name: str, total_pages: int, first: int, last: int, parts: list[dict]
+) -> str:
+    return _complete_with_retry(
+        [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": _batch_prompt(doc_name, first, last, total_pages),
+                    },
+                    *parts,
+                ],
+            }
+        ],
+        "these notes hit the output-token limit and may be missing "
+        "their tail.",
     )
-    text, truncated = llm_client.complete(
+
+
+def _consolidated_profile(doc_name: str, total_pages: int, joined: str) -> str:
+    return _complete_with_retry(
         [
             {
                 "role": "user",
                 "content": (
-                    _consolidation_prompt(doc_name, total_pages)
-                    + "\n\n"
-                    + joined
+                    _consolidation_prompt(doc_name, total_pages) + "\n\n" + joined
                 ),
             }
         ],
-        system=ANALYST_SYSTEM_PROMPT,
+        "this profile hit the output-token limit and may be missing "
+        "its tail.",
     )
-    if truncated:
-        text += (
-            "\n\n[Note: this profile hit the output-token limit and may "
-            "be missing its tail.]"
+
+
+def analyze_documents(
+    docs: dict[str, tuple[int, list[tuple[int, int, list[dict]]]]],
+    concurrency: int = 6,
+    progress: Optional[Callable[[int, int, str], None]] = None,
+) -> tuple[dict[str, str], list[str]]:
+    """Analyze every document in parallel; return ``(profiles, warnings)``.
+
+    ``docs`` maps file name -> ``(total_pages, batches)``, where
+    ``batches`` is the output of ``page_batches()`` in ``app.py``. All
+    page batches of all documents share one pool of ``concurrency``
+    worker threads; each document's consolidation call is submitted the
+    moment its own batches are done. ``progress(done, total, label)`` is
+    invoked from the calling thread only, so it is safe to update
+    Streamlit widgets from it.
+
+    A batch that fails (after one retry) becomes a placeholder note
+    inside the profile instead of sinking the whole document; a failed
+    consolidation falls back to the concatenated batch notes. Both are
+    reported in ``warnings``.
+    """
+    total_steps = sum(
+        len(batches) + (1 if len(batches) > 1 else 0)
+        for _, batches in docs.values()
+    )
+    done = 0
+    notes: dict[str, list[Optional[str]]] = {
+        name: [None] * len(batches) for name, (_, batches) in docs.items()
+    }
+    remaining = {name: len(batches) for name, (_, batches) in docs.items()}
+    results: dict[str, str] = {}
+    warnings: list[str] = []
+
+    def report(label: str) -> None:
+        if progress:
+            progress(done, total_steps, f"{label} ({done}/{total_steps} steps)")
+
+    def joined_notes(name: str) -> str:
+        ranges = [(f, l) for f, l, _ in docs[name][1]]
+        return "\n\n".join(
+            f"### Notes for pages {first}-{last}\n\n{text}"
+            for (first, last), text in zip(ranges, notes[name])
         )
-    return text
+
+    with ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
+        tasks: dict[Future, tuple] = {}
+        for name, (total_pages, batches) in docs.items():
+            for idx, (first, last, parts) in enumerate(batches):
+                fut = pool.submit(
+                    _batch_notes, name, total_pages, first, last, parts
+                )
+                tasks[fut] = ("batch", name, idx, first, last)
+
+        pending = set(tasks)
+        while pending:
+            finished, pending = wait(pending, return_when=FIRST_COMPLETED)
+            for fut in finished:
+                kind, name, *rest = tasks.pop(fut)
+                done += 1
+                if kind == "batch":
+                    idx, first, last = rest
+                    exc = fut.exception()
+                    if exc is None:
+                        notes[name][idx] = fut.result()
+                        report(f"{name}: pages {first}-{last} analyzed")
+                    else:
+                        notes[name][idx] = (
+                            f"[Analysis of pages {first}-{last} failed: {exc}]"
+                        )
+                        warnings.append(
+                            f"{name}: pages {first}-{last} could not be "
+                            f"analyzed ({exc}); the profile marks them as "
+                            "missing."
+                        )
+                        report(f"{name}: pages {first}-{last} failed")
+                    remaining[name] -= 1
+                    if remaining[name] == 0:
+                        if len(notes[name]) == 1:
+                            results[name] = notes[name][0]
+                        else:
+                            cfut = pool.submit(
+                                _consolidated_profile,
+                                name,
+                                docs[name][0],
+                                joined_notes(name),
+                            )
+                            tasks[cfut] = ("consolidate", name)
+                            pending.add(cfut)
+                else:  # consolidate
+                    exc = fut.exception()
+                    if exc is None:
+                        results[name] = fut.result()
+                        report(f"{name}: profile consolidated")
+                    else:
+                        results[name] = joined_notes(name)
+                        warnings.append(
+                            f"{name}: consolidation failed ({exc}); using "
+                            "the raw per-batch notes as the profile."
+                        )
+                        report(f"{name}: consolidation failed")
+
+    # Keep the upload order in the returned profiles.
+    return {name: results[name] for name in docs if name in results}, warnings
 
 
 def chat_context(profiles: dict[str, str]) -> str:

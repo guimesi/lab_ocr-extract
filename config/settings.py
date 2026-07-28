@@ -72,6 +72,11 @@ class Settings:
     # high explicitly (Claude Sonnet supports far more than the default).
     llm_max_tokens: int = int(os.getenv("LLM_MAX_TOKENS", "").strip() or "16000")
 
+    # How many analysis calls run in parallel: all page batches of all
+    # documents share one queue served by this many worker threads.
+    # Lower it if the serving endpoint starts throttling.
+    llm_concurrency: int = int(os.getenv("LLM_CONCURRENCY", "").strip() or "6")
+
     @property
     def databricks_enabled(self) -> bool:
         return bool(self.databricks_host and self.databricks_token)

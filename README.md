@@ -17,7 +17,9 @@ generate a complete **authoring template** for writing a new one like them.
 2. **Pattern analysis** — each document is analyzed in page batches (one
    model call per batch, plus one consolidation call for large PDFs),
    producing a markdown *profile* per document: structure, sections, layout,
-   formatting, data conventions, style. Profiles are shown and downloadable.
+   formatting, data conventions, style. All batches of all documents share
+   one queue served by `LLM_CONCURRENCY` parallel workers, so several large
+   PDFs are analyzed concurrently. Profiles are shown and downloadable.
 3. **Chat grounded in the analyses** — the chat context is the document
    profiles (plus one first-page image per document for visual reference),
    not the raw pages, so any number/size of PDFs keeps working.
@@ -57,6 +59,8 @@ input (the pay-per-token Claude endpoints do).
 analysis call — large PDFs are analyzed in batches and the notes consolidated.
 `LLM_MAX_TOKENS` (default 16000) is the output budget per call; raise it if
 analyses or templates come back truncated.
+`LLM_CONCURRENCY` (default 6) is how many analysis calls run in parallel;
+lower it if the serving endpoint starts throttling.
 
 ### Snowflake (unused on this branch)
 

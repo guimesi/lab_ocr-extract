@@ -90,7 +90,9 @@ with st.sidebar:
     st.caption(
         f"Documents are analyzed {SETTINGS.pdf_pages_per_call} page(s) "
         "per model call (PDF_PAGES_PER_CALL); large PDFs take one call "
-        "per batch plus one to consolidate."
+        "per batch plus one to consolidate. Up to "
+        f"{SETTINGS.llm_concurrency} calls run in parallel "
+        "(LLM_CONCURRENCY)."
     )
 
 
@@ -151,30 +153,26 @@ with st.expander("Preview (first page of each document)"):
 if st.button(
     "Analyze documents", type="primary", icon=":material/manage_search:"
 ):
-    profiles: dict[str, str] = {}
-    failed: list[str] = []
+    doc_inputs: dict[str, tuple[int, list[tuple[int, int, list[dict]]]]] = {}
     for name, pages, _ in docs:
         parts = [llm_client.image_content(b, m) for b, m in pages]
-        with st.status(f"Analyzing {name}...", expanded=False) as status:
-            try:
-                profiles[name] = patterns.analyze_document(
-                    name,
-                    len(parts),
-                    page_batches(parts),
-                    progress=lambda msg, s=status: s.update(label=msg),
-                )
-                status.update(label=f"{name}: analyzed", state="complete")
-            except Exception as exc:
-                failed.append(name)
-                status.update(
-                    label=f"{name}: analysis failed ({exc})", state="error"
-                )
-    if failed:
-        st.warning(
-            "Some documents could not be analyzed and were skipped: "
-            f"{', '.join(failed)}.",
-            icon=":material/error:",
+        doc_inputs[name] = (len(parts), page_batches(parts))
+    bar = st.progress(0.0, text="Queueing the analysis...")
+    try:
+        profiles, warnings = patterns.analyze_documents(
+            doc_inputs,
+            concurrency=SETTINGS.llm_concurrency,
+            progress=lambda done, total, label: bar.progress(
+                done / total, text=label
+            ),
         )
+    except Exception as exc:
+        bar.empty()
+        st.error(f"Analysis failed: {exc}")
+        st.stop()
+    bar.empty()
+    for warning in warnings:
+        st.warning(warning, icon=":material/error:")
     if profiles:
         st.session_state.profiles = profiles
         st.session_state.messages = []
