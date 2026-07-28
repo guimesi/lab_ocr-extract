@@ -17,6 +17,8 @@ finish - no document waits for the others.
 """
 from __future__ import annotations
 
+import random
+import time
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from typing import Callable, Optional
 
@@ -97,17 +99,50 @@ def _consolidation_prompt(doc_name: str, total: int) -> str:
     )
 
 
+# Waits (seconds) between attempts after a 429. The Databricks limit is
+# per *minute*, so an immediate retry would just fail again - each wait
+# lets the window refill, and the jitter below keeps the parallel
+# workers from all retrying at the same instant.
+_RATE_LIMIT_WAITS = (15, 30, 60, 90)
+
+
+def _is_rate_limit(exc: Exception) -> bool:
+    if getattr(exc, "status_code", None) == 429:
+        return True
+    text = str(exc)
+    return (
+        "429" in text
+        or "REQUEST_LIMIT_EXCEEDED" in text
+        or "rate limit" in text.lower()
+    )
+
+
 def _complete_with_retry(messages: list[dict], truncation_note: str) -> str:
-    """One analysis call, retried once on any error (transient network /
-    throttling hiccups are common when several calls run in parallel)."""
-    try:
-        text, truncated = llm_client.complete(
-            messages, system=ANALYST_SYSTEM_PROMPT
-        )
-    except Exception:
-        text, truncated = llm_client.complete(
-            messages, system=ANALYST_SYSTEM_PROMPT
-        )
+    """One analysis call with retries.
+
+    Rate-limit errors (429) back off through ``_RATE_LIMIT_WAITS`` with
+    jitter before giving up; any other error gets a single immediate
+    retry (transient network hiccups are common with parallel calls).
+    """
+    rate_limit_attempt = 0
+    other_attempt = 0
+    while True:
+        try:
+            text, truncated = llm_client.complete(
+                messages, system=ANALYST_SYSTEM_PROMPT
+            )
+            break
+        except Exception as exc:
+            if _is_rate_limit(exc):
+                if rate_limit_attempt >= len(_RATE_LIMIT_WAITS):
+                    raise
+                waits = _RATE_LIMIT_WAITS[rate_limit_attempt]
+                time.sleep(waits * (0.8 + 0.4 * random.random()))
+                rate_limit_attempt += 1
+            else:
+                if other_attempt >= 1:
+                    raise
+                other_attempt += 1
     if truncated:
         text += f"\n\n[Note: {truncation_note}]"
     return text

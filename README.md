@@ -59,8 +59,11 @@ input (the pay-per-token Claude endpoints do).
 analysis call — large PDFs are analyzed in batches and the notes consolidated.
 `LLM_MAX_TOKENS` (default 16000) is the output budget per call; raise it if
 analyses or templates come back truncated.
-`LLM_CONCURRENCY` (default 6) is how many analysis calls run in parallel;
-lower it if the serving endpoint starts throttling.
+`LLM_CONCURRENCY` (default 6) is how many analysis calls run in parallel.
+Rate-limited calls (429) automatically back off and retry for up to a few
+minutes; if you still see `REQUEST_LIMIT_EXCEEDED` warnings, lower
+`LLM_CONCURRENCY` or point `DATABRICKS_MODEL` at an endpoint with a higher
+rate tier (e.g. `databricks-claude-sonnet-4-5`).
 
 ### Snowflake (unused on this branch)
 
