@@ -77,6 +77,21 @@ class Settings:
     # Lower it if the serving endpoint starts throttling.
     llm_concurrency: int = int(os.getenv("LLM_CONCURRENCY", "").strip() or "6")
 
+    # Upload validation: reject files above this size (MB).
+    max_upload_mb: int = int(os.getenv("MAX_UPLOAD_MB", "").strip() or "100")
+
+    # Character budget for the document context sent to the chat model.
+    # Documents larger than this are sent as outline + selected section.
+    chat_context_chars: int = int(
+        os.getenv("CHAT_CONTEXT_CHARS", "").strip() or "60000"
+    )
+
+    # Cap on how many embedded images/charts get an AI description per
+    # document (each description is one vision call).
+    max_image_descriptions: int = int(
+        os.getenv("MAX_IMAGE_DESCRIPTIONS", "").strip() or "12"
+    )
+
     @property
     def databricks_enabled(self) -> bool:
         return bool(self.databricks_host and self.databricks_token)

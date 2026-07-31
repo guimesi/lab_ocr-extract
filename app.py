@@ -1,289 +1,230 @@
 """
-Doc Patterns - Streamlit app (variation of OCR Extract).
+PDF Extraction Editor - Streamlit app.
 
-Upload several (large) PDFs of the same document kind -> Claude
-analyzes each one's structure and patterns, in page batches (via
-Databricks serving endpoint, OpenAI SDK) -> chat about the documents
-grounded in those analyses -> generate a template / authoring guide
-for writing a new document like them.
+Upload a PDF -> the pipeline extracts its full content (native text,
+layout, tables, OCR for scanned pages, AI descriptions for visuals) into
+structured elements with source references -> review the original PDF
+and the extraction side by side (click an element to highlight its
+source region) -> chat with the AI to answer questions or apply edits ->
+download the result as Markdown, JSON or HTML.
 
 Run: streamlit run app.py
 """
 from __future__ import annotations
 
+import logging
+
 import streamlit as st
 
 from config.settings import SETTINGS
-from src import documents, llm_client, patterns
+from src.components import (
+    chat_panel,
+    export_panel,
+    extraction_viewer,
+    pdf_viewer,
+    revision_history,
+)
+from src.services import pdf_processor
+from src.services.document_editor import DocumentEditor
+from src.utils import state_utils
+from src.utils.file_utils import content_hash
+from src.utils.validation import ValidationError, validate_pdf_upload
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s - %(message)s",
+)
 
 st.set_page_config(
-    page_title="Doc Patterns",
-    page_icon=":material/description:",
+    page_title="PDF Extraction Editor",
+    page_icon=":material/edit_document:",
     layout="wide",
 )
 
-
-# =============================================================================
-# Cached data access
-# =============================================================================
-
-@st.cache_data(ttl=600, show_spinner="Preparing the document...")
-def load_document_pages(
-    file_bytes: bytes, mime_type: str
-) -> tuple[list[tuple[bytes, str]], int]:
-    return documents.load_pages(file_bytes, mime_type)
-
-
-def page_batches(parts: list[dict]) -> list[tuple[int, int, list[dict]]]:
-    """Split page content parts into ``(first, last, parts)`` batches so
-    large PDFs fit the request size limit (one model call per batch)."""
-    size = max(1, SETTINGS.pdf_pages_per_call)
-    return [
-        (i + 1, min(i + size, len(parts)), parts[i : i + size])
-        for i in range(0, len(parts), size)
-    ]
+state_utils.init_state()
 
 
 # =============================================================================
-# Session state
-# =============================================================================
-
-_DEFAULTS = {
-    "messages": [],       # visible chat history: {"role", "content"}
-    "profiles": None,     # per-document analysis: {file name: markdown}
-    "docs_key": None,     # ids of the current uploads, to detect changes
-}
-for key, default in _DEFAULTS.items():
-    st.session_state.setdefault(key, default)
-
-
-def reset_results() -> None:
-    st.session_state.messages = []
-    st.session_state.profiles = None
-
-
-# =============================================================================
-# Sidebar: connection status
+# Sidebar: status + processing options
 # =============================================================================
 
 with st.sidebar:
-    st.title(":material/description: Doc Patterns")
+    st.title(":material/edit_document: PDF Extraction Editor")
     st.caption(
-        "Upload reference documents of the same kind; the model analyzes "
-        "their structure and patterns so you can chat about them and "
-        "generate an authoring template for new documents."
+        "Extract a PDF into structured, source-mapped content; review it "
+        "next to the original, edit it via AI chat or by hand, and export "
+        "Markdown / JSON / HTML."
     )
 
     if SETTINGS.databricks_enabled:
         st.success(
-            f"Databricks: `{SETTINGS.databricks_model}`",
+            f"Model: `{SETTINGS.databricks_model}`",
             icon=":material/cloud_done:",
         )
     else:
         st.error(
-            "Databricks is not configured. Set DATABRICKS_HOST and "
-            "DATABRICKS_TOKEN in `.env` (see `.env.example`).",
+            "Databricks is not configured - OCR, visual descriptions and "
+            "chat are unavailable. Set DATABRICKS_HOST and DATABRICKS_TOKEN "
+            "in `.env` (see `.env.example`).",
             icon=":material/cloud_off:",
         )
 
     st.divider()
+    st.subheader("Processing options")
+    opt_ocr = st.toggle(
+        "OCR scanned pages (AI)",
+        value=True,
+        disabled=not SETTINGS.databricks_enabled,
+        help="Pages without native text are transcribed by the vision model.",
+    )
+    opt_visuals = st.toggle(
+        "Describe images & charts (AI)",
+        value=True,
+        disabled=not SETTINGS.databricks_enabled,
+        help=(
+            "Embedded pictures, charts and diagrams get an AI-generated "
+            f"description (up to {SETTINGS.max_image_descriptions} per "
+            "document, MAX_IMAGE_DESCRIPTIONS)."
+        ),
+    )
     st.caption(
-        f"Documents are analyzed {SETTINGS.pdf_pages_per_call} page(s) "
-        "per model call (PDF_PAGES_PER_CALL); large PDFs take one call "
-        "per batch plus one to consolidate. Up to "
-        f"{SETTINGS.llm_concurrency} calls run in parallel "
-        "(LLM_CONCURRENCY)."
+        "Uploads are processed in memory only; pages sent for OCR, visual "
+        "descriptions and chat context go to the configured Databricks "
+        "model endpoint. Nothing is stored on disk."
     )
 
 
 # =============================================================================
-# 1. Reference documents
+# 1. Upload & validation
 # =============================================================================
 
-st.header("1. Reference documents", divider="gray")
-
-uploads = st.file_uploader(
-    "Upload the reference documents (PDFs or images) - ideally several "
-    "examples of the same document kind.",
-    type=["pdf", "png", "jpg", "jpeg", "webp", "gif"],
-    accept_multiple_files=True,
+upload = st.file_uploader(
+    "Upload a PDF document",
+    type=["pdf"],
+    accept_multiple_files=False,
 )
 
-if not uploads:
-    st.session_state.docs_key = None
-    reset_results()
+if upload is None:
+    state_utils.reset_document_state()
     st.info(
-        "Upload one or more documents to get started.",
+        "Upload a PDF to get started. The full content is extracted with "
+        "source references, so every passage can be traced back to its "
+        "exact location in the original file.",
         icon=":material/upload_file:",
     )
     st.stop()
 
-# A change in the set of files replaces previous results / conversation.
-docs_key = tuple(f.file_id for f in uploads)
-if st.session_state.docs_key != docs_key:
-    st.session_state.docs_key = docs_key
-    reset_results()
+file_bytes = upload.getvalue()
+doc_hash = content_hash(file_bytes)
 
-# Load pages for every document up front (cached per file content).
-docs: list[tuple[str, list[tuple[bytes, str]], int]] = []
-total_calls = 0
-for f in uploads:
-    pages, total = load_document_pages(f.getvalue(), f.type or "image/png")
-    if total > len(pages):
-        st.warning(
-            f"{f.name}: the PDF has {total} pages; only the first "
-            f"{len(pages)} will be processed (PDF_MAX_PAGES).",
-            icon=":material/warning:",
-        )
-    docs.append((f.name, pages, total))
-    n_batches = len(page_batches([None] * len(pages)))
-    total_calls += n_batches + (1 if n_batches > 1 else 0)
-
-st.caption(
-    f"{len(docs)} document(s), "
-    f"{sum(len(pages) for _, pages, _ in docs)} page(s) in total - "
-    f"the analysis will take about {total_calls} model call(s)."
-)
-with st.expander("Preview (first page of each document)"):
-    cols = st.columns(min(len(docs), 4))
-    for i, (name, pages, total) in enumerate(docs):
-        with cols[i % len(cols)]:
-            st.image(pages[0][0], caption=f"{name} ({total} pages)", width="stretch")
-
-if st.button(
-    "Analyze documents", type="primary", icon=":material/manage_search:"
-):
-    doc_inputs: dict[str, tuple[int, list[tuple[int, int, list[dict]]]]] = {}
-    for name, pages, _ in docs:
-        parts = [llm_client.image_content(b, m) for b, m in pages]
-        doc_inputs[name] = (len(parts), page_batches(parts))
-    bar = st.progress(0.0, text="Queueing the analysis...")
-    try:
-        profiles, warnings = patterns.analyze_documents(
-            doc_inputs,
-            concurrency=SETTINGS.llm_concurrency,
-            progress=lambda done, total, label: bar.progress(
-                done / total, text=label
-            ),
-        )
-    except Exception as exc:
-        bar.empty()
-        st.error(f"Analysis failed: {exc}")
-        st.stop()
-    bar.empty()
-    for warning in warnings:
-        st.warning(warning, icon=":material/error:")
-    if profiles:
-        st.session_state.profiles = profiles
-        st.session_state.messages = []
-
-
-# =============================================================================
-# 2. Analyses
-# =============================================================================
-
-profiles = st.session_state.profiles
-if profiles:
-    st.header("2. Document analyses", divider="gray")
-    st.caption(
-        "One structural profile per document - this is the context the "
-        "chat reasons over."
+try:
+    real_page_count = validate_pdf_upload(
+        file_bytes, upload.name, SETTINGS.max_upload_mb
     )
-    for name, profile in profiles.items():
-        with st.expander(f":material/description: {name}"):
-            st.markdown(profile)
-    combined = "\n\n---\n\n".join(
-        f"# {name}\n\n{profile}" for name, profile in profiles.items()
-    )
-    st.download_button(
-        "Download all analyses (.md)",
-        combined.encode("utf-8"),
-        "document_analyses.md",
-        "text/markdown",
-        icon=":material/download:",
-    )
-
-
-# =============================================================================
-# 3. Chat + template generation
-# =============================================================================
-
-st.header("3. Chat about the documents", divider="gray")
-
-if not profiles:
-    st.info(
-        "Run the analysis first - the chat answers based on the "
-        "document profiles.",
-        icon=":material/manage_search:",
-    )
+except ValidationError as exc:
+    state_utils.reset_document_state()
+    st.error(str(exc), icon=":material/error:")
     st.stop()
 
-for msg in st.session_state.messages:
-    with st.chat_message(msg["role"]):
-        st.write(msg["content"])
+# A different file replaces the previous document, chat and history.
+if st.session_state.doc_hash not in (None, doc_hash):
+    state_utils.reset_document_state()
 
-prompt = st.chat_input(
-    "Ask about the documents, their patterns, or how to write a new one...",
-    submit_mode="disable",
-)
-if st.button(
-    "Generate authoring template",
-    icon=":material/edit_document:",
-    help=(
-        "Asks the model for a complete template: required sections, "
-        "formatting and data conventions, style guidance, a fill-in "
-        "skeleton and a validation checklist."
-    ),
-):
-    prompt = patterns.TEMPLATE_REQUEST
 
-if prompt:
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.write(prompt)
+# =============================================================================
+# 2. Processing (once per file content - reruns reuse the session copy)
+# =============================================================================
 
-    # API messages: the document profiles (plus one first-page image per
-    # document, as visual reference) go as context in the first user
-    # turn; the visible history follows as plain text. Raw pages are NOT
-    # sent - five large PDFs would not fit one request.
-    context_content: list[dict] = [
-        {"type": "text", "text": patterns.chat_context(profiles)}
-    ]
-    for name, pages, _ in docs:
-        context_content.append(
-            {"type": "text", "text": f'First page of "{name}":'}
-        )
-        context_content.append(llm_client.image_content(*pages[0]))
-    api_messages: list[dict] = [
-        {"role": "user", "content": context_content},
-        {
-            "role": "assistant",
-            "content": (
-                "Understood. I have the analysis profiles of every "
-                "reference document. What would you like to know?"
-            ),
-        },
-        *st.session_state.messages,
-    ]
-
-    with st.chat_message("assistant"):
-        try:
-            response = st.write_stream(
-                llm_client.stream_chat(
-                    api_messages, system=patterns.ANALYST_SYSTEM_PROMPT
-                )
-            )
-        except Exception as exc:
-            st.error(f"Error calling the model: {exc}")
-            st.session_state.messages.pop()
-            st.stop()
-    st.session_state.messages.append({"role": "assistant", "content": response})
-
-if st.session_state.messages and st.session_state.messages[-1]["role"] == "assistant":
-    st.download_button(
-        "Download last answer (.md)",
-        str(st.session_state.messages[-1]["content"]).encode("utf-8"),
-        "answer.md",
-        "text/markdown",
-        icon=":material/download:",
+if st.session_state.doc_hash != doc_hash:
+    st.caption(
+        f'"{upload.name}" - {real_page_count} page(s), '
+        f"{len(file_bytes) / (1024 * 1024):.1f} MB. Not processed yet."
     )
+    if not st.button(
+        "Process document", type="primary", icon=":material/manage_search:"
+    ):
+        st.stop()
+    bar = st.progress(0.0, text="Queueing...")
+    options = pdf_processor.ProcessingOptions(
+        use_llm_ocr=opt_ocr, describe_visuals=opt_visuals
+    )
+    try:
+        document = pdf_processor.process_pdf(
+            file_bytes,
+            upload.name,
+            options=options,
+            progress=lambda label, fraction: bar.progress(fraction, text=label),
+        )
+    except pdf_processor.ProcessingError as exc:
+        bar.empty()
+        st.error(f"Extraction failed: {exc}", icon=":material/error:")
+        st.stop()
+    except Exception as exc:  # never crash the app on unexpected errors
+        bar.empty()
+        logging.getLogger(__name__).exception("Unexpected processing failure")
+        st.error(f"Unexpected error during extraction: {exc}", icon=":material/error:")
+        st.stop()
+    bar.empty()
+    st.session_state.doc_hash = doc_hash
+    st.session_state.pdf_bytes = file_bytes
+    st.session_state.editor = DocumentEditor(document)
+    st.session_state.processing_warnings = list(document.warnings)
+    st.rerun()
+
+editor: DocumentEditor = st.session_state.editor
+document = editor.document
+
+
+# =============================================================================
+# 3. Status line + warnings
+# =============================================================================
+
+if st.session_state.processing_warnings:
+    with st.expander(
+        f":material/warning: Extraction completed with "
+        f"{len(st.session_state.processing_warnings)} warning(s)",
+        expanded=False,
+    ):
+        for warning in st.session_state.processing_warnings:
+            st.warning(warning, icon=":material/error:")
+
+meta = document.metadata
+st.caption(
+    f'"{document.file_name}" - {document.page_count} page(s) '
+    f"({meta.get('native_pages', '?')} native, "
+    f"{meta.get('ocr_pages', '?')} scanned), "
+    f"{len(document.elements)} element(s) extracted"
+    + (f", language: {document.language}" if document.language else "")
+    + f". Processed at {document.processed_at}."
+)
+
+
+# =============================================================================
+# 4. Side-by-side: original PDF | extraction / chat / history / export
+# =============================================================================
+
+left, right = st.columns([1, 1], gap="medium")
+
+with left:
+    st.subheader(":material/picture_as_pdf: Original PDF", divider="gray")
+    pdf_viewer.render_pdf_viewer(
+        st.session_state.pdf_bytes, document, real_page_count
+    )
+
+with right:
+    doc_tab, chat_tab, history_tab, export_tab = st.tabs(
+        [
+            ":material/article: Document",
+            ":material/chat: Chat",
+            ":material/history: History",
+            ":material/download: Export",
+        ]
+    )
+    with doc_tab:
+        extraction_viewer.render_extraction_viewer(editor)
+    with chat_tab:
+        chat_panel.render_chat_panel(editor)
+    with history_tab:
+        revision_history.render_revision_history(editor)
+    with export_tab:
+        export_panel.render_export_panel(editor)

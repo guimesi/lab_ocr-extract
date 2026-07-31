@@ -4,30 +4,33 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-**This branch (`doc-pattern-chat`) is a variation of the OCR Extract app on `master`.** Streamlit app: upload several (large) PDFs of the same document kind → Claude analyzes each one's structure/patterns into a markdown *profile* → chat about the documents grounded in those profiles → one-click generation of an authoring template for writing a new document like them. UI text, prompts, and user-facing error messages are in English — keep that convention.
+**This branch (`feature/pdf-extraction-editor`) is the PDF Extraction Editor.** Streamlit app: upload one PDF → the pipeline extracts its full content into structured, source-mapped elements → review the original PDF and the extraction side by side (selecting an element highlights its bounding box in the PDF) → edit via AI chat or manually, with revision history and undo/redo → export Markdown/JSON/HTML. UI text, prompts, and user-facing error messages are in English — keep that convention.
 
 ## Commands
 
 ```powershell
 python -m venv .venv
-.venv\Scripts\Activate.ps1
+.venv\Scripts\Activate.ps1     # macOS/Linux: source .venv/bin/activate
 pip install -r requirements.txt
-copy .env.example .env   # fill in values
+copy .env.example .env          # fill in values
 streamlit run app.py
+python -m pytest tests/         # all model calls are mocked; no .env needed
 ```
-
-There are no tests or linters configured.
 
 ## Architecture
 
-Modules with one direction of dependency: `app.py` → `src/documents.py` + `src/patterns.py` → `src/llm_client.py` → `config/settings.py`.
+Dependency direction: `app.py` → `src/components/*` → `src/services/*` → `src/models/*` + `src/llm_client.py` → `config/settings.py`. Components render UI and own no business logic; services are Streamlit-free and fully unit-tested — keep both properties.
 
-**LLM access is Claude via Databricks, not the Anthropic API.** `src/llm_client.py` uses the OpenAI SDK pointed at `{DATABRICKS_HOST}/serving-endpoints`, with the Databricks PAT as `api_key` and the serving endpoint name (e.g. `databricks-claude-sonnet-4-5`) as `model`. Messages and images use the OpenAI format (base64 data URIs via `image_content()`); Databricks forwards them to Claude. Don't switch to the `anthropic` SDK or Anthropic message format. `stream_chat`/`complete` accept an optional `system` override; this branch uses `patterns.ANALYST_SYSTEM_PROMPT` everywhere.
+**LLM access is Claude via Databricks, not the Anthropic API.** `src/llm_client.py` uses the OpenAI SDK pointed at `{DATABRICKS_HOST}/serving-endpoints`, with the Databricks PAT as `api_key` and the serving endpoint name as `model`. Don't switch to the `anthropic` SDK or Anthropic message format. All service-level calls go through `src/services/llm_support.py` (`complete_with_retry`: 429 backoff with jitter, one immediate retry otherwise; `parse_json_payload`: tolerant JSON extraction) — route new model calls through it too.
 
-**Everything the model sees is images.** `src/documents.py` normalizes an upload into `(bytes, mime)` pages: images pass through; PDFs are rendered page-by-page to PNG with PyMuPDF (~144 dpi, capped at `PDF_MAX_PAGES`, 0 = unlimited).
+**Extraction pipeline** (`src/services/pdf_processor.py` orchestrates): validation → native text per page (PyMuPDF `get_text("dict")` blocks classified by font size/boldness/list markers in `native_text_extractor.py`) → tables (`find_tables()` → `table_data` rows + Markdown, overlapping text suppressed) → layout (`layout_analyzer.py`: column splitting/ordering, repeated header/footer/page-number detection) → OCR for pages with <30 native chars (`ocr_service.py`: page PNG → model → JSON elements with percentage bboxes converted back to points) → visual descriptions for embedded images (`visual_content_analyzer.py`, capped by `MAX_IMAGE_DESCRIPTIONS`) → assembly (`source_mapper.py`: order, title promotion, parent links, language). Failures become warnings + placeholder elements, never crashes — preserve that. PyMuPDF objects and the `progress` callback stay on the calling thread; only pure model calls go into the `ThreadPoolExecutor`.
 
-**Map-reduce analysis is the core trick** (`src/patterns.py`): several large PDFs never fit one request, so each document is analyzed in batches of `PDF_PAGES_PER_CALL` pages (`page_batches()` in `app.py`, one `complete()` call per batch), and multi-batch notes are consolidated by a final text-only call into one *document profile*. `analyze_documents()` runs the whole thing in parallel: all batches of all documents share one `ThreadPoolExecutor` of `LLM_CONCURRENCY` workers, a document's consolidation is submitted as soon as its own batches finish, rate-limited calls (429) back off with jitter through `_RATE_LIMIT_WAITS` while other errors get one immediate retry, batches that still fail become placeholder notes instead of sinking the document, and the `progress` callback fires only on the calling thread (Streamlit widgets are not thread-safe — keep it that way). Profiles live in `st.session_state.profiles` (`{file name: markdown}`). The prompts insist on grounded, concrete output (quote real titles/labels, `[illegible]` for unreadable fragments, never invent) — preserve that in any prompt changes.
+**Everything is source-mapped.** Each `DocumentElement` has an 8-hex `id` and a `SourceReference` (1-based page, `BoundingBox` in PDF points top-left origin, extraction method, confidence). The PDF viewer (`src/components/pdf_viewer.py`) renders pages server-side and draws the selected element's box — there is no browser-side PDF.js. Edits must never strip `id` or `source`; the first edit snapshots `original_content`.
 
-**Chat context assembly** ([app.py](app.py)): the visible chat history in `st.session_state.messages` is not what's sent to the API — each turn rebuilds `api_messages` with a synthetic first user turn carrying `patterns.chat_context(profiles)` (all profiles as text) plus one first-page image per document, a canned assistant acknowledgment, then the visible history. **Raw pages are never sent to chat** — that's what keeps the request size flat regardless of document count/size. The "Generate authoring template" button injects `patterns.TEMPLATE_REQUEST` as a normal chat turn. Changing the set of uploaded files (detected via the tuple of `file_id`s in `docs_key`) resets profiles and chat.
+**Editing is revision-based** (`src/services/document_editor.py`): `DocumentEditor` holds the pristine `original` (never mutated) and the working document; every change goes through `apply_operations()` (update/insert_after/insert_before/delete) which records a `Revision` with per-element before/after dicts and list indices, enabling exact undo/redo. Don't mutate `editor.document.elements` directly.
 
-**Snowflake is unused on this branch.** `src/snowflake_client.py` and the `SNOWFLAKE_*` settings are kept only to ease merges with `master`; don't wire them into this app. `Settings.databricks_enabled` still gates model access — the sidebar shows an error and calls raise when unconfigured; keep new features behind that flag rather than failing at startup.
+**Chat protocol** (`src/services/chat_service.py`): context = current document serialized with `[id]` markers (outline degradation over `CHAT_CONTEXT_CHARS`), rebuilt every turn. The model replies either prose (answer) or a single JSON object `{"action":"edit","summary":…,"edits":[…]}`; `parse_chat_response` validates ids and converts to `EditOperation`s. Deletes or >3 ops require user confirmation via `st.session_state.pending_edit` before applying. Keep prompts grounded (never invent content, `[illegible]` markers) in any prompt changes.
+
+**App state** lives in `st.session_state` (keys in `src/utils/state_utils.py`), keyed by upload content hash — the extraction runs once per file and reruns reuse the session copy. Exports (`export_service.py`) read the current edited document; HTML output must stay fully escaped (`_inline` escapes before styling).
+
+**Snowflake is unused on this branch.** `src/snowflake_client.py` and the `SNOWFLAKE_*` settings are kept only to ease merges with `master`; don't wire them in. `Settings.databricks_enabled` gates all model features — extraction of native-text PDFs must keep working without credentials, and new AI features belong behind that flag rather than failing at startup.
