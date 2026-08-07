@@ -51,9 +51,9 @@ class SourceReference:
     """Reference from an extracted element back to the original PDF.
 
     ``page`` is 1-based. ``bounding_box`` may be None when the location
-    could not be determined (e.g. some OCR output). ``extraction_method``
-    records which pipeline stage produced the element (``native_text``,
-    ``table_detection``, ``llm_ocr``, ``visual_analysis``, ``authored``).
+    could not be determined. ``extraction_method`` records which pipeline
+    stage produced the element (``native_text``, ``table_detection``,
+    ``scanned_page``, ``authored``).
     ``confidence`` is 0..1 when the method provides one, else None.
     """
 

@@ -11,12 +11,10 @@ STATE_DEFAULTS = {
     "doc_hash": None,          # content hash of the processed upload
     "editor": None,            # DocumentEditor for the current document
     "pdf_bytes": None,         # raw bytes of the processed PDF
-    "chat_messages": [],       # visible chat history: {"role", "content"}
     "selected_element_id": None,
     "viewer_page": 1,
     "viewer_zoom": 1.5,
     "viewer_synced_id": None,  # last element the viewer auto-navigated to
-    "pending_edit": None,      # AI edit awaiting user confirmation
     "processing_warnings": [],
 }
 
@@ -31,11 +29,9 @@ def reset_document_state() -> None:
     st.session_state.doc_hash = None
     st.session_state.editor = None
     st.session_state.pdf_bytes = None
-    st.session_state.chat_messages = []
     st.session_state.selected_element_id = None
     st.session_state.viewer_page = 1
     st.session_state.viewer_synced_id = None
-    st.session_state.pending_edit = None
     st.session_state.processing_warnings = []
 
 

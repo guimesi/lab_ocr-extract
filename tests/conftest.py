@@ -160,7 +160,7 @@ def sample_document() -> ExtractedDocument:
             page=2,
             table_data=[["A", "B"], ["1", "2"]],
         ),
-        make_element("img1", ElementType.IMAGE, "A bar chart of sales by region", page=2),
+        make_element("img1", ElementType.IMAGE, "*[Image - content not extracted.]*", page=2),
         make_element("f1", ElementType.FOOTER, "Confidential"),
         make_element("pn1", ElementType.PAGE_NUMBER, "1"),
     ]

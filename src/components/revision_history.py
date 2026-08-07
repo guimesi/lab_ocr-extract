@@ -8,7 +8,6 @@ import streamlit as st
 from src.services.document_editor import DocumentEditor
 
 _SOURCE_LABELS = {
-    "ai": ":material/smart_toy: AI edit",
     "manual": ":material/person: Manual edit",
     "restore": ":material/history: Restore",
 }
@@ -65,8 +64,8 @@ def render_revision_history(editor: DocumentEditor) -> None:
     history = editor.history
     if not history:
         st.info(
-            "No changes yet - edits from the chat or the Document tab "
-            "will appear here.",
+            "No changes yet - edits from the Document tab will appear "
+            "here.",
             icon=":material/history:",
         )
         return

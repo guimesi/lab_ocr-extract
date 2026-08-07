@@ -2,8 +2,7 @@
 
 Pages are rendered server-side with PyMuPDF; the highlight rectangle of
 the selected element is drawn onto the page image before rasterizing, so
-no browser-side PDF machinery is needed and highlighting works for both
-native and OCR bounding boxes. Rendered pages are cached per
+no browser-side PDF machinery is needed. Rendered pages are cached per
 (document, page, zoom, highlight) so reruns are cheap.
 """
 from __future__ import annotations

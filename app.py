@@ -2,10 +2,9 @@
 PDF Extraction Editor - Streamlit app.
 
 Upload a PDF -> the pipeline extracts its full content (native text,
-layout, tables, OCR for scanned pages, AI descriptions for visuals) into
-structured elements with source references -> review the original PDF
-and the extraction side by side (click an element to highlight its
-source region) -> chat with the AI to answer questions or apply edits ->
+layout, tables) into structured elements with source references ->
+review the original PDF and the extraction side by side (click an
+element to highlight its source region) -> edit the content by hand ->
 download the result as Markdown, JSON or HTML.
 
 Run: streamlit run app.py
@@ -18,7 +17,6 @@ import streamlit as st
 
 from config.settings import SETTINGS
 from src.components import (
-    chat_panel,
     export_panel,
     extraction_viewer,
     pdf_viewer,
@@ -45,52 +43,20 @@ state_utils.init_state()
 
 
 # =============================================================================
-# Sidebar: status + processing options
+# Sidebar
 # =============================================================================
 
 with st.sidebar:
     st.title(":material/edit_document: PDF Extraction Editor")
     st.caption(
         "Extract a PDF into structured, source-mapped content; review it "
-        "next to the original, edit it via AI chat or by hand, and export "
+        "next to the original, edit it by hand, and export "
         "Markdown / JSON / HTML."
     )
-
-    if SETTINGS.databricks_enabled:
-        st.success(
-            f"Model: `{SETTINGS.databricks_model}`",
-            icon=":material/cloud_done:",
-        )
-    else:
-        st.error(
-            "Databricks is not configured - OCR, visual descriptions and "
-            "chat are unavailable. Set DATABRICKS_HOST and DATABRICKS_TOKEN "
-            "in `.env` (see `.env.example`).",
-            icon=":material/cloud_off:",
-        )
-
-    st.divider()
-    st.subheader("Processing options")
-    opt_ocr = st.toggle(
-        "OCR scanned pages (AI)",
-        value=True,
-        disabled=not SETTINGS.databricks_enabled,
-        help="Pages without native text are transcribed by the vision model.",
-    )
-    opt_visuals = st.toggle(
-        "Describe images & charts (AI)",
-        value=True,
-        disabled=not SETTINGS.databricks_enabled,
-        help=(
-            "Embedded pictures, charts and diagrams get an AI-generated "
-            f"description (up to {SETTINGS.max_image_descriptions} per "
-            "document, MAX_IMAGE_DESCRIPTIONS)."
-        ),
-    )
     st.caption(
-        "Uploads are processed in memory only; pages sent for OCR, visual "
-        "descriptions and chat context go to the configured Databricks "
-        "model endpoint. Nothing is stored on disk."
+        "Everything runs locally: uploads are processed in memory only and "
+        "nothing is sent to external services or stored on disk. Pages "
+        "without native text (scanned images) are marked as not extracted."
     )
 
 
@@ -126,7 +92,7 @@ except ValidationError as exc:
     st.error(str(exc), icon=":material/error:")
     st.stop()
 
-# A different file replaces the previous document, chat and history.
+# A different file replaces the previous document and history.
 if st.session_state.doc_hash not in (None, doc_hash):
     state_utils.reset_document_state()
 
@@ -145,14 +111,10 @@ if st.session_state.doc_hash != doc_hash:
     ):
         st.stop()
     bar = st.progress(0.0, text="Queueing...")
-    options = pdf_processor.ProcessingOptions(
-        use_llm_ocr=opt_ocr, describe_visuals=opt_visuals
-    )
     try:
         document = pdf_processor.process_pdf(
             file_bytes,
             upload.name,
-            options=options,
             progress=lambda label, fraction: bar.progress(fraction, text=label),
         )
     except pdf_processor.ProcessingError as exc:
@@ -192,7 +154,7 @@ meta = document.metadata
 st.caption(
     f'"{document.file_name}" - {document.page_count} page(s) '
     f"({meta.get('native_pages', '?')} native, "
-    f"{meta.get('ocr_pages', '?')} scanned), "
+    f"{meta.get('scanned_pages', '?')} scanned), "
     f"{len(document.elements)} element(s) extracted"
     + (f", language: {document.language}" if document.language else "")
     + f". Processed at {document.processed_at}."
@@ -200,7 +162,7 @@ st.caption(
 
 
 # =============================================================================
-# 4. Side-by-side: original PDF | extraction / chat / history / export
+# 4. Side-by-side: original PDF | extraction / history / export
 # =============================================================================
 
 left, right = st.columns([1, 1], gap="medium")
@@ -212,18 +174,15 @@ with left:
     )
 
 with right:
-    doc_tab, chat_tab, history_tab, export_tab = st.tabs(
+    doc_tab, history_tab, export_tab = st.tabs(
         [
             ":material/article: Document",
-            ":material/chat: Chat",
             ":material/history: History",
             ":material/download: Export",
         ]
     )
     with doc_tab:
         extraction_viewer.render_extraction_viewer(editor)
-    with chat_tab:
-        chat_panel.render_chat_panel(editor)
     with history_tab:
         revision_history.render_revision_history(editor)
     with export_tab:

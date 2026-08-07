@@ -20,7 +20,7 @@ def test_source_reference_roundtrip():
     ref = SourceReference(
         page=3,
         bounding_box=BoundingBox(1, 2, 3, 4),
-        extraction_method="llm_ocr",
+        extraction_method="scanned_page",
         confidence=0.87,
     )
     restored = SourceReference.from_dict(ref.to_dict())
