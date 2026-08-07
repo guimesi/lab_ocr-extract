@@ -1,7 +1,7 @@
-"""Upload validation: malformed, protected, oversized, non-PDF files."""
+"""Upload validation failures produce clear, user-facing errors."""
 import pytest
 
-from src.utils.validation import ValidationError, validate_pdf_upload
+from src.validation import ValidationError, validate_pdf_upload
 
 
 def test_valid_pdf_returns_page_count(text_pdf_bytes):
@@ -15,12 +15,12 @@ def test_empty_file_rejected():
 
 def test_non_pdf_rejected():
     with pytest.raises(ValidationError, match="does not look like a PDF"):
-        validate_pdf_upload(b"hello world" * 100, "notes.pdf", max_mb=100)
+        validate_pdf_upload(b"plain text", "fake.pdf", max_mb=100)
 
 
 def test_corrupted_pdf_rejected():
-    with pytest.raises(ValidationError, match="corrupted|could not be opened"):
-        validate_pdf_upload(b"%PDF-1.7\ngarbage garbage", "bad.pdf", max_mb=100)
+    with pytest.raises(ValidationError, match="corrupted"):
+        validate_pdf_upload(b"%PDF-1.7 garbage", "broken.pdf", max_mb=100)
 
 
 def test_oversized_pdf_rejected(text_pdf_bytes):
